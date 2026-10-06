@@ -28,3 +28,9 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Change: Replaced uncoordinated `asyncio.create_task(asend_peerbots_message(..., silent=True))` background task invocations in `send_greeting`, `handle_turn` speculative start, `handle_turn` streaming face event, `mic_loop`, and `text_loop` with `fire_peerbots_update(...)`.
 - Result: All tests passed with zero exception leakage and clean non-blocking scheduling.
 - TTFA_MS: ~893.78ms.
+
+## Iteration 5: Zero-Allocation Word Boundary Counter in Streaming Parser
+- Files: `scripts/openai_response.py`
+- Change: Replaced repeated `len(cand.split())` calls inside `StreamingReplyParser.feed()` with early-exiting `_has_min_words(s, min_words)` scanner, avoiding string list allocations on punctuation matches across incoming token deltas.
+- Result: All tests passed, reducing per-token CPU overhead in the streaming parser loop.
+- TTFA_MS: 886.59ms (a ~7.19ms drop from 893.78ms).

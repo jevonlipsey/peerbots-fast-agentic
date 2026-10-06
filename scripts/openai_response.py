@@ -348,6 +348,21 @@ MIN_FIRST_CHUNK_CHARS = 14
 MIN_CLAUSE_CHUNK_WORDS = 4
 
 
+def _has_min_words(s, min_words):
+    # fast early-exit word counter avoiding list allocation per streaming token
+    count = 0
+    in_word = False
+    for ch in s:
+        if ch.isspace():
+            in_word = False
+        elif not in_word:
+            count += 1
+            if count >= min_words:
+                return True
+            in_word = True
+    return False
+
+
 class StreamingReplyParser:
     """
     incremental parser for structured json:
@@ -406,14 +421,14 @@ class StreamingReplyParser:
                     term_match = _RE_TERMINAL_PUNCT.search(self.speech_buffer)
                     if term_match:
                         cand = self.speech_buffer[:term_match.start(1) + len(term_match.group(1).rstrip())].strip()
-                        if len(cand.split()) >= MIN_FIRST_CHUNK_WORDS or len(cand) >= MIN_FIRST_CHUNK_CHARS:
+                        if _has_min_words(cand, MIN_FIRST_CHUNK_WORDS) or len(cand) >= MIN_FIRST_CHUNK_CHARS:
                             split_pos = term_match.end()
                             sentence = cand
                     if split_pos is None:
                         for cm in _RE_CLAUSE_PUNCT.finditer(self.speech_buffer):
                             punct = cm.group(1) or cm.group(2)
                             cand = self.speech_buffer[:cm.start() + len(punct)].strip()
-                            if len(cand.split()) >= MIN_FIRST_CHUNK_WORDS or len(cand) >= MIN_FIRST_CHUNK_CHARS:
+                            if _has_min_words(cand, MIN_FIRST_CHUNK_WORDS) or len(cand) >= MIN_FIRST_CHUNK_CHARS:
                                 split_pos = cm.end()
                                 sentence = cand
                                 break
@@ -428,7 +443,7 @@ class StreamingReplyParser:
                         for cm in _RE_CLAUSE_PUNCT.finditer(self.speech_buffer):
                             punct = cm.group(1) or cm.group(2)
                             cand = self.speech_buffer[:cm.start() + len(punct)].strip()
-                            if len(cand.split()) >= MIN_CLAUSE_CHUNK_WORDS:
+                            if _has_min_words(cand, MIN_CLAUSE_CHUNK_WORDS):
                                 split_pos = cm.end()
                                 sentence = cand
                                 break
