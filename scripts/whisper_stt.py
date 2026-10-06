@@ -12,6 +12,7 @@ import os
 import platform
 import random
 import re
+import struct
 import subprocess
 import sys
 import tempfile
@@ -150,6 +151,20 @@ def start_swift_worker():
     return proc
 
 
+def _audio_to_wav_bytes(audio):
+    # fast in-memory wav serialization for 16khz 16-bit mono without io.BytesIO overhead
+    if audio.sample_rate == 16000 and audio.sample_width == 2:
+        raw = audio.frame_data
+        data_size = len(raw)
+        header = struct.pack(
+            '<4sI4s4sIHHIIHH4sI',
+            b'RIFF', data_size + 36, b'WAVE', b'fmt ',
+            16, 1, 1, 16000, 32000, 2, 16, b'data', data_size
+        )
+        return header + raw
+    return audio.get_wav_data(convert_rate=16000, convert_width=2)
+
+
 def transcribe_audio(recognizer, audio, swift_proc=None):
     '''
     multi-tier transcription:
@@ -168,7 +183,7 @@ def transcribe_audio(recognizer, audio, swift_proc=None):
     # tier 1: coreml swift worker
     if IS_MAC and swift_proc is not None and swift_proc.poll() is None:
         try:
-            wav_data = audio.get_wav_data(convert_rate=16000, convert_width=2)
+            wav_data = _audio_to_wav_bytes(audio)
             with open(_SWIFT_TMP_WAV, 'wb') as f:
                 f.write(wav_data)
             text = None
@@ -324,9 +339,7 @@ def listen_audio_silero(
             del raw_buffer[:1024]
 
             audio_int16 = np.frombuffer(frame_bytes, dtype=np.int16)
-            if len(audio_int16) != 512:
-                audio_int16 = np.pad(audio_int16, (0, max(0, 512 - len(audio_int16))))[:512]
-            audio_float = torch.from_numpy(audio_int16.astype(np.float32) / 32768.0)
+            audio_float = torch.from_numpy(audio_int16.astype(np.float32) * (1.0 / 32768.0))
 
             prob = vad_model(audio_float, 16000).item()
 
@@ -395,8 +408,9 @@ def listen_once(
     outputs:
     transcribed string, '' if silence or junk
     '''
+    vad_model = get_vad_model() if use_silero else None
     try:
-        if use_silero and get_vad_model() is not None:
+        if vad_model is not None:
             audio = listen_audio_silero(
                 source,
                 timeout=timeout,
@@ -422,7 +436,7 @@ def listen_once(
     extensions = 0
     while text and _ends_with_continuation(text) and extensions < 3:
         try:
-            if use_silero and get_vad_model() is not None:
+            if vad_model is not None:
                 extra_audio = listen_audio_silero(
                     source,
                     timeout=1.2,

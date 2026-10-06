@@ -34,3 +34,9 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Change: Replaced repeated `len(cand.split())` calls inside `StreamingReplyParser.feed()` with early-exiting `_has_min_words(s, min_words)` scanner, avoiding string list allocations on punctuation matches across incoming token deltas.
 - Result: All tests passed, reducing per-token CPU overhead in the streaming parser loop.
 - TTFA_MS: 886.59ms (a ~7.19ms drop from 893.78ms).
+
+## Iteration 6: Fast In-Memory WAV Serialization & VAD Model Cache in STT
+- Files: `scripts/whisper_stt.py`
+- Change: Added `_audio_to_wav_bytes` with direct 44-byte binary RIFF WAV header generation, bypassing `io.BytesIO` and `wave.open` overhead when sending audio to Swift CoreML worker. Cached `vad_model` reference across `listen_once` adaptive extensions, and replaced float division with multiplication in silero audio frame conversion.
+- Result: All tests passed, pytest execution time reduced to 0.84s.
+- TTFA_MS: ~887.42ms.
