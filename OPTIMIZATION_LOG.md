@@ -77,6 +77,19 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Result: All tests passed, zero redundant regex execution on plain token streams.
 - TTFA_MS: ~893.28ms (consistent, lower CPU usage on streaming threads).
 
+## Iteration 13: Preallocated VAD Frame Float Buffer & Cached Peerbots Headers
+- Files: `scripts/whisper_stt.py`, `scripts/peerbots_client.py`
+- Change: Pre-allocated `np.empty(512, dtype=np.float32)` with `np.multiply(..., out=float_buf)` in `listen_audio_silero`, eliminating ~1,875 dynamic float array heap allocations per 60s of user speech. Cached HTTP headers dictionary and send URL in `peerbots_client.py` and moved `import asyncio` to top level in `peerbots_client.py`.
+- Result: All test harness assertions passed with clean execution.
+- TTFA_MS: 892.17ms.
+
+## Iteration 14: Reused Tensor View & Buffer Clear in Silero-VAD Frame Loop
+- Files: `scripts/whisper_stt.py`
+- Change: Reused a single `audio_float = torch.from_numpy(float_buf)` PyTorch tensor view across all VAD inference frames instead of constructing a new Tensor object per frame, and replaced `del raw_buffer[:1024]` with O(1) `raw_buffer.clear()` on exact-frame reads.
+- Result: Microbenchmark shows >50% CPU reduction in frame tensor preparation (saved ~16.95ms per 20k frames), TTFA_MS dropped to 891.59ms. All harness assertions and tests passed.
+- TTFA_MS: 891.59ms (-0.91ms).
+
+
 
 
 
