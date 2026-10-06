@@ -1,0 +1,12 @@
+openai>=1.0.0
+mcp>=1.0.0
+SpeechRecognition>=3.10.0
+python-dotenv>=1.0.0
+# mcp 2.x needs pydantic>=2.12 (validate_json by_name + input_schema rename)
+pydantic>=2.12
+requests>=2.0.0
+rich>=13.0.0
+
+# Non-Mac STT Fallback (Windows/Linux)
+openai-whisper>=20231117
+PyAudio>=0.2.14

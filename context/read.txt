@@ -1,0 +1,2 @@
+context lives here. drop pdfs, audio files, photos, etc,
+if you need the peerbot to remember specific documents!

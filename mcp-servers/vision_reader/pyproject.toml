@@ -1,0 +1,21 @@
+[project]
+name = "vision-reader"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Jevon Lipsey", email = "jevonlipsey1029@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "mcp<2",
+    "pillow>=12.3.0",
+    "pypdf>=6.16.2",
+]
+
+[project.scripts]
+vision-reader = "vision_reader:main"
+
+[build-system]
+requires = ["uv_build>=0.12.6,<0.13.0"]
+build-backend = "uv_build"

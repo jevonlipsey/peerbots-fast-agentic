@@ -1,0 +1,15 @@
+{
+  "mcpServers": {
+    "time": {
+      "command": "uvx",
+      "args": ["-q", "mcp-server-time"]
+    },
+    "memory": {
+      "command": "mcp-server-memory",
+      "args": [],
+      "env": {
+        "MEMORY_FILE_PATH": "./memory.jsonl"
+      }
+    }
+  }
+}
