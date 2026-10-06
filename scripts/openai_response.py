@@ -35,6 +35,7 @@ if USE_LOCAL_LLM:
     MODEL = 'gemma4:e4b'
 
 _CLIENT = None
+_KEEPALIVE_TASK = None
 
 
 def get_client():
@@ -49,9 +50,40 @@ def get_client():
     return _CLIENT
 
 
+async def _keepalive_worker():
+    # pings openai models.list every 45s to keep the tls connection pool hot during silence
+    while True:
+        try:
+            await asyncio.sleep(45)
+            client = get_client()
+            await client.models.list()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            pass
+
+
+def start_openai_keepalive(loop=None):
+    global _KEEPALIVE_TASK
+    if USE_LOCAL_LLM:
+        return None
+    if _KEEPALIVE_TASK is None or _KEEPALIVE_TASK.done():
+        active_loop = loop or asyncio.get_running_loop()
+        _KEEPALIVE_TASK = active_loop.create_task(_keepalive_worker())
+    return _KEEPALIVE_TASK
+
+
+def stop_openai_keepalive():
+    global _KEEPALIVE_TASK
+    if _KEEPALIVE_TASK is not None and not _KEEPALIVE_TASK.done():
+        _KEEPALIVE_TASK.cancel()
+        _KEEPALIVE_TASK = None
+
+
 async def close_client():
     # close client on shutdown
     global _CLIENT
+    stop_openai_keepalive()
     if _CLIENT is not None:
         try:
             await _CLIENT.close()
@@ -407,12 +439,68 @@ class StreamingReplyParser:
         return []
 
 
+### session state tracking
+_SESSION_TURN_COUNT = 0
+_RECENT_OPENERS = []
+_RECENT_EMOTIONS = []
+
+
+def reset_session_context():
+    # resets session turn tracking and anti-repetition memory
+    global _SESSION_TURN_COUNT, _RECENT_OPENERS, _RECENT_EMOTIONS
+    _SESSION_TURN_COUNT = 0
+    _RECENT_OPENERS = []
+    _RECENT_EMOTIONS = []
+
+
+def get_session_context():
+    return {
+        'turn_count': _SESSION_TURN_COUNT,
+        'recent_openers': list(_RECENT_OPENERS),
+        'recent_emotions': list(_RECENT_EMOTIONS),
+    }
+
+
+def _build_session_prefix():
+    global _SESSION_TURN_COUNT
+    _SESSION_TURN_COUNT += 1
+
+    hints = []
+    if _RECENT_OPENERS:
+        last_openers = _RECENT_OPENERS[-3:]
+        openers_str = ', '.join(f"'{o}'" for o in last_openers)
+        hints.append(f'Avoid recent openers: {openers_str}')
+
+    if len(_RECENT_EMOTIONS) >= 3 and len(set(_RECENT_EMOTIONS[-3:])) == 1:
+        rep_emotion = _RECENT_EMOTIONS[-1]
+        hints.append(f"Emotion dampening: you used '{rep_emotion}' for 3 turns in a row; vary your affect if appropriate")
+
+    hint_text = f" ({'; '.join(hints)})" if hints else ''
+    return f'[session: turn {_SESSION_TURN_COUNT}]{hint_text}\n\n'
+
+
+def _record_turn_metadata(speech, emotion):
+    global _RECENT_OPENERS, _RECENT_EMOTIONS
+    if speech:
+        words = speech.strip().split()
+        if words:
+            opener = ' '.join(words[:min(3, len(words))])
+            _RECENT_OPENERS.append(opener)
+            if len(_RECENT_OPENERS) > 5:
+                _RECENT_OPENERS.pop(0)
+
+    if emotion:
+        _RECENT_EMOTIONS.append(emotion)
+        if len(_RECENT_EMOTIONS) > 5:
+            _RECENT_EMOTIONS.pop(0)
+
+
 def _base_kwargs(messages):
     kwargs = {
         'model': MODEL,
         'messages': messages,
         'timeout': 30.0,
-        'max_completion_tokens': 90,
+        'max_completion_tokens': 140,
     }
     if USE_LOCAL_LLM:
         kwargs['extra_body'] = {'options': {'num_ctx': 4096}, 'format': 'json'}
@@ -443,9 +531,11 @@ async def stream_peerbots_reply(user_text, tools_list=None, tool_router=None):
     tools_list = tools_list or []
     tool_router = tool_router or {}
     system_prompt = load_system_prompt()
+    session_prefix = _build_session_prefix()
+    system_content = session_prefix + system_prompt
     chat_history = get_history()
     chat_history.append({'role': 'user', 'content': user_text})
-    messages = [{'role': 'system', 'content': system_prompt}] + chat_history
+    messages = [{'role': 'system', 'content': system_content}] + chat_history
 
     start_t = time.time()
     try:
@@ -568,6 +658,7 @@ async def stream_peerbots_reply(user_text, tools_list=None, tool_router=None):
                     'total_ms': elapsed_ms,
                 },
             }
+            _record_turn_metadata(reply.get('speech'), reply.get('emotion'))
             chat_history.append({'role': 'assistant', 'content': json.dumps(reply)})
             save_history(chat_history)
             return

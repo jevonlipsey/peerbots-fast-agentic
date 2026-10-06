@@ -10,3 +10,7 @@ rich>=13.0.0
 # Non-Mac STT Fallback (Windows/Linux)
 openai-whisper>=20231117
 PyAudio>=0.2.14
+
+# Neural VAD for sub-second speech endpointing
+silero-vad>=6.0.0
+onnxruntime>=1.16.0

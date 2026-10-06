@@ -20,11 +20,13 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts'))
-from whisper_stt import IS_MAC, listen_once, start_swift_worker
+from whisper_stt import IS_MAC, listen_once, start_swift_worker, get_vad_model
 from openai_response import (
     connect_mcp,
     stream_peerbots_reply,
     prewarm_openai,
+    start_openai_keepalive,
+    stop_openai_keepalive,
     close_client as close_openai_client,
 )
 from peerbots_client import (
@@ -74,6 +76,67 @@ GREETING_COLOR = 'Green'
 _CURRENT_SWIFT_PROC = None
 _PLAYBACK_QUEUE = None
 _USE_DROID = False
+
+### dynamic voice speed per emotion
+EMOTION_SPEED_MAP = {
+    'Happy': 1.12,
+    'Surprised': 1.10,
+    'Neutral': 1.05,
+    'Concerned': 0.92,
+    'Sad': 0.90,
+    'Sleepy': 0.88,
+}
+
+
+def get_voice_speed_for_emotion(emotion, base_speed=KOKORO_SPEED):
+    '''
+    scales playback speed based on lulo emotional state.
+
+    inputs:
+    emotion: emotion string (e.g. 'Happy', 'Concerned')
+    base_speed: base float speed from config
+    outputs:
+    adjusted float speed
+    '''
+    if not emotion:
+        return base_speed
+    mult = EMOTION_SPEED_MAP.get(emotion)
+    if mult is not None:
+        return round(mult * (base_speed / 1.0), 2)
+    return base_speed
+
+
+def make_nod_callback(loop):
+    '''
+    triggers silent face nod feedback during extended user monologues.
+
+    inputs:
+    loop: running asyncio event loop
+    outputs:
+    callable(seconds)
+    '''
+    nod_faces = {
+        10: ('Happy', 'White'),
+        25: ('Neutral', 'White'),
+        45: ('Surprised', 'White'),
+    }
+
+    def _on_nod(seconds):
+        face = nod_faces.get(seconds)
+        if not face:
+            return
+        emotion, color = face
+        try:
+            loop.call_soon_threadsafe(
+                lambda: asyncio.create_task(
+                    asend_peerbots_message('', emotion, color, silent=True)
+                )
+            )
+            console.print(f'  [dim cyan]-> [listening nod {seconds}s] {emotion} / {color}[/]')
+        except Exception:
+            pass
+
+    return _on_nod
 
 
 async def send_greeting():
@@ -135,6 +198,7 @@ async def handle_turn(user_text, tools_list, tool_router):
         _PLAYBACK_QUEUE.reset_turn()
 
     face_updated = False
+    current_emotion = 'Neutral'
     tts_tasks = []
     spoken_sentences = []
     first_audio_sent = False
@@ -158,6 +222,7 @@ async def handle_turn(user_text, tools_list, tool_router):
                 # update peerbots face immediately without waiting for tts
                 emotion = event['emotion']
                 color = event['color']
+                current_emotion = emotion
                 if _USE_DROID:
                     # silent update: sets face expression & halo glow with 0 volume
                     asyncio.create_task(
@@ -177,8 +242,11 @@ async def handle_turn(user_text, tools_list, tool_router):
                     async def _synthesize_and_enqueue(sentence_text, idx):
                         nonlocal first_audio_sent, first_audio_time, tts1_ms
                         s_start = time.time()
+                        target_speed = get_voice_speed_for_emotion(
+                            current_emotion, KOKORO_SPEED
+                        )
                         audio_data = await synthesize_speech(
-                            sentence_text, voice=KOKORO_VOICE, speed=KOKORO_SPEED
+                            sentence_text, voice=KOKORO_VOICE, speed=target_speed
                         )
                         s_ms = int((time.time() - s_start) * 1000)
                         if idx == 0:
@@ -289,7 +357,13 @@ def _signal_handler(signum, frame):
     os._exit(0)
 
 
-async def mic_loop(mic_index, tools_list, tool_router, pause_threshold=PAUSE_THRESHOLD):
+async def mic_loop(
+    mic_index,
+    tools_list,
+    tool_router,
+    pause_threshold=PAUSE_THRESHOLD,
+    use_silero=True,
+):
     # blocking mic loop, runs until ctrl-c
     global _CURRENT_SWIFT_PROC
     swift_proc = None
@@ -306,7 +380,16 @@ async def mic_loop(mic_index, tools_list, tool_router, pause_threshold=PAUSE_THR
 
     recognizer = sr.Recognizer()
     recognizer.pause_threshold = pause_threshold
-    recognizer.non_speaking_duration = 0.3
+    recognizer.non_speaking_duration = 0.15
+
+    vad_available = use_silero and (get_vad_model() is not None)
+    if vad_available:
+        console.print("[dim white][[stt]]: neural silero-vad endpointing active (~150ms offset)[/]")
+    else:
+        console.print(f"[dim white][[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]")
+
+    loop = asyncio.get_running_loop()
+    nod_cb = make_nod_callback(loop) if _USE_DROID else None
 
     with sr.Microphone(device_index=mic_index, sample_rate=16000) as source:
         if getattr(source, "stream", None) is None:
@@ -321,7 +404,16 @@ async def mic_loop(mic_index, tools_list, tool_router, pause_threshold=PAUSE_THR
             "\n[bold dark_orange][[LISTENING - speak to lulo (ctrl-c to quit)]][/]"
         )
         while True:
-            text = await asyncio.to_thread(listen_once, recognizer, source, swift_proc)
+            text = await asyncio.to_thread(
+                listen_once,
+                recognizer,
+                source,
+                swift_proc,
+                timeout=None,
+                phrase_limit=90,
+                use_silero=vad_available,
+                nod_callback=nod_cb,
+            )
             if IS_MAC and swift_proc is not None and swift_proc.poll() is not None:
                 console.print("[dim white][[ reviving crashed stt worker... ]][/]")
                 try:
@@ -372,6 +464,7 @@ async def amain(
     mic_index,
     pause_threshold=PAUSE_THRESHOLD,
     enable_droid=USE_DROID_AUDIO,
+    use_silero=True,
 ):
     global _USE_DROID, _PLAYBACK_QUEUE
     missing = [
@@ -417,9 +510,10 @@ async def amain(
     else:
         _USE_DROID = False
 
-    # prewarm openai connection pool
+    # prewarm openai connection pool and start keepalive
     console.print('[dim white][[ pre-warming openai connection pool... ]][/]')
     await prewarm_openai()
+    start_openai_keepalive()
 
     # boot mcp servers once, tools stay live for the whole session
     from contextlib import AsyncExitStack
@@ -435,10 +529,12 @@ async def amain(
                     tools_list,
                     tool_router,
                     pause_threshold=pause_threshold,
+                    use_silero=use_silero,
                 )
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
     finally:
+        stop_openai_keepalive()
         if _PLAYBACK_QUEUE:
             await _PLAYBACK_QUEUE.stop()
         stop_kokoro_process()
@@ -468,6 +564,11 @@ def main():
         type=float,
         default=PAUSE_THRESHOLD,
         help='seconds of silence before speech is considered done (default: 0.8)',
+    )
+    parser.add_argument(
+        '--legacy-vad',
+        action='store_true',
+        help='disable silero-vad neural endpointing and use legacy energy-based threshold',
     )
     parser.add_argument(
         '--no-droid',
@@ -500,6 +601,7 @@ def main():
                 mic_index=args.mic_index,
                 pause_threshold=args.pause_threshold,
                 enable_droid=not args.no_droid,
+                use_silero=not args.legacy_vad,
             )
         )
     except (KeyboardInterrupt, *_ExceptionGroupTypes):

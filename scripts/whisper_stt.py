@@ -7,6 +7,7 @@ layer 1: microphone -> whisper_stt -> openai_response
 '''
 
 import atexit
+import collections
 import os
 import platform
 import random
@@ -234,7 +235,141 @@ def _ends_with_continuation(text):
     return last_word in CONTINUATION_CUES
 
 
-def listen_once(recognizer, source, swift_proc=None, timeout=None, phrase_limit=20):
+### silero vad neural endpointing
+_VAD_MODEL = None
+
+
+def get_vad_model():
+    global _VAD_MODEL
+    if _VAD_MODEL is None:
+        try:
+            import silero_vad
+            _VAD_MODEL = silero_vad.load_silero_vad(onnx=True)
+        except Exception as e:
+            console.print(f'[dim yellow][[ could not load silero vad: {e} ]][/]')
+            _VAD_MODEL = None
+    return _VAD_MODEL
+
+
+def listen_audio_silero(
+    source,
+    timeout=None,
+    phrase_time_limit=90.0,
+    min_silence_duration_s=0.15,
+    non_speaking_duration_s=0.15,
+    speech_threshold=0.45,
+    nod_callback=None,
+):
+    '''
+    captures one utterance using neural silero-vad for instant ~150ms speech-offset detection.
+
+    inputs:
+    source: open speech_recognition audio source (e.g. Microphone)
+    timeout: max seconds to wait for speech to start
+    phrase_time_limit: max speech duration (default 90s)
+    min_silence_duration_s: silence duration to trigger endpoint (default 0.15s)
+    non_speaking_duration_s: pre/post padding silence duration (default 0.15s)
+    speech_threshold: vad speech probability threshold (default 0.45)
+    nod_callback: callable(seconds) triggered at 10s, 25s, 45s of continuous speech
+    outputs:
+    AudioData instance
+    '''
+    import numpy as np
+    import torch
+
+    vad_model = get_vad_model()
+    if vad_model is None:
+        raise RuntimeError('silero vad model unavailable')
+
+    vad_model.reset_states()
+
+    sample_rate = getattr(source, 'SAMPLE_RATE', 16000)
+    sample_width = getattr(source, 'SAMPLE_WIDTH', 2)
+    frame_duration_s = 512.0 / 16000.0
+    pre_speech_count = max(1, int(round(non_speaking_duration_s / frame_duration_s)))
+    silence_frames_needed = max(2, int(round(min_silence_duration_s / frame_duration_s)))
+
+    pre_speech_frames = collections.deque(maxlen=pre_speech_count)
+    spoken_frames = []
+    speaking_started = False
+    silence_counter = 0
+    speech_start_time = None
+    start_time = time.time()
+    nodded = {10: False, 25: False, 45: False}
+
+    raw_buffer = bytearray()
+    stream = getattr(source, 'stream', None)
+    if stream is None:
+        raise RuntimeError('audio source stream is closed or missing')
+
+    while True:
+        chunk = stream.read(512)
+        if not chunk:
+            break
+        raw_buffer.extend(chunk)
+
+        while len(raw_buffer) >= 1024:
+            frame_bytes = bytes(raw_buffer[:1024])
+            del raw_buffer[:1024]
+
+            audio_int16 = np.frombuffer(frame_bytes, dtype=np.int16)
+            if len(audio_int16) != 512:
+                audio_int16 = np.pad(audio_int16, (0, max(0, 512 - len(audio_int16))))[:512]
+            audio_float = torch.from_numpy(audio_int16.astype(np.float32) / 32768.0)
+
+            prob = vad_model(audio_float, 16000).item()
+
+            if not speaking_started:
+                if timeout is not None and (time.time() - start_time) > timeout:
+                    raise sr.WaitTimeoutError('listening timed out waiting for speech')
+                pre_speech_frames.append(frame_bytes)
+                if prob >= speech_threshold:
+                    speaking_started = True
+                    speech_start_time = time.time()
+                    spoken_frames.extend(pre_speech_frames)
+                    spoken_frames.append(frame_bytes)
+                    silence_counter = 0
+            else:
+                spoken_frames.append(frame_bytes)
+                speech_elapsed = time.time() - speech_start_time
+
+                if nod_callback:
+                    for mark in (10, 25, 45):
+                        if speech_elapsed >= mark and not nodded[mark]:
+                            nodded[mark] = True
+                            try:
+                                nod_callback(mark)
+                            except Exception:
+                                pass
+
+                if phrase_time_limit and speech_elapsed > phrase_time_limit:
+                    break
+
+                if prob < (speech_threshold - 0.15):
+                    silence_counter += 1
+                    if silence_counter >= silence_frames_needed:
+                        break
+                else:
+                    silence_counter = 0
+
+        if speaking_started and silence_counter >= silence_frames_needed:
+            break
+
+    if not spoken_frames:
+        return sr.AudioData(b'', sample_rate, sample_width)
+
+    return sr.AudioData(b''.join(spoken_frames), sample_rate, sample_width)
+
+
+def listen_once(
+    recognizer,
+    source,
+    swift_proc=None,
+    timeout=None,
+    phrase_limit=90,
+    use_silero=True,
+    nod_callback=None,
+):
     '''
     block for one complete utterance with adaptive continuation endpointing.
 
@@ -242,16 +377,31 @@ def listen_once(recognizer, source, swift_proc=None, timeout=None, phrase_limit=
     recognizer: active speech_recognition recognizer
     source: open microphone source
     swift_proc: coreml worker handle on mac, else none
+    timeout: optional timeout in seconds to wait for speech start
+    phrase_limit: max speech duration in seconds (default: 90)
+    use_silero: whether to use neural silero vad (default: True)
+    nod_callback: callable(seconds) for monologue nod feedback (10s, 25s, 45s)
     outputs:
     transcribed string, '' if silence or junk
     '''
     try:
-        audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_limit)
+        if use_silero and get_vad_model() is not None:
+            audio = listen_audio_silero(
+                source,
+                timeout=timeout,
+                phrase_time_limit=phrase_limit,
+                min_silence_duration_s=0.15,
+                non_speaking_duration_s=0.15,
+                nod_callback=nod_callback,
+            )
+        else:
+            audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_limit)
     except sr.WaitTimeoutError:
         return ''
     except Exception as e:
         console.print(f'[bold red][[ capture error: {e} ]][/]')
         return ''
+
     text, _ = transcribe_audio(recognizer, audio, swift_proc)
     if is_hallucination(text):
         return ''
@@ -259,9 +409,18 @@ def listen_once(recognizer, source, swift_proc=None, timeout=None, phrase_limit=
 
     # adaptive endpointing: if user paused on a continuation cue, give a quick bonus window
     extensions = 0
-    while text and _ends_with_continuation(text) and extensions < 2:
+    while text and _ends_with_continuation(text) and extensions < 3:
         try:
-            extra_audio = recognizer.listen(source, timeout=1.2, phrase_time_limit=10)
+            if use_silero and get_vad_model() is not None:
+                extra_audio = listen_audio_silero(
+                    source,
+                    timeout=1.2,
+                    phrase_time_limit=20,
+                    min_silence_duration_s=0.20,
+                    nod_callback=nod_callback,
+                )
+            else:
+                extra_audio = recognizer.listen(source, timeout=1.2, phrase_time_limit=20)
             extra_text, _ = transcribe_audio(recognizer, extra_audio, swift_proc)
             if extra_text and not is_hallucination(extra_text):
                 text = f'{text} {extra_text.strip()}'.strip()
