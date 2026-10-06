@@ -65,6 +65,12 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Result: All tests passed, test suite execution time reduced to 0.83s, average TTFA from speech end dropped to 1038.19ms.
 - TTFA_MS: ~887.58ms.
 
+## Iteration 11: Short-Circuit Face Regexes & Skip Unescaped Replacements
+- Files: `scripts/openai_response.py`
+- Change: Short-circuited emotion/color regex scanning once both are found (`if should_check_face and (not self.emotion or not self.color)`). Fast-path check for `'\\' in s` before invoking chained `.replace('\\"', '"').replace('\\n', ' ')`, eliminating redundant string allocations across clean streaming deltas.
+- Result: All test harness assertions passed with clean execution.
+- TTFA_MS: ~887.12ms.
+
 
 
 
