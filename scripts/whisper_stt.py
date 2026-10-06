@@ -231,7 +231,7 @@ def _ends_with_continuation(text):
     words = t.split()
     if not words:
         return False
-    last_word = re.sub(r'^[^\w]+|[^\w]+$', '', words[-1].lower())
+    last_word = words[-1].lower().strip('.,!?;:"\'-—–…')
     return last_word in CONTINUATION_CUES
 
 

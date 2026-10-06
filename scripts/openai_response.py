@@ -133,6 +133,18 @@ VALID_COLORS = [
     'White',
 ]
 
+_VALID_EMOTIONS_MAP = {e.lower(): e for e in VALID_EMOTIONS}
+_VALID_COLORS_MAP = {c.lower(): c for c in VALID_COLORS}
+
+# pre-compiled regex patterns for streaming json parsing
+_RE_EMOTION = re.compile(r'"emotion"\s*:\s*"([^"]+)"')
+_RE_COLOR = re.compile(r'"color"\s*:\s*"([^"]+)"')
+_RE_SPEECH_START = re.compile(r'"speech"\s*:\s*"')
+_RE_UNESCAPED_QUOTE = re.compile(r'(?<!\\)"')
+_RE_TERMINAL_PUNCT = re.compile(r'([.!?]+)\s+')
+_RE_CLAUSE_PUNCT = re.compile(r'(?:([;:,])\s+|([—–]|--)\s*)')
+_RE_LEFTOVER_CLEANUP = re.compile(r'["\}\s]+$')
+
 REPLY_SCHEMA = {
     'name': 'peerbots_reply',
     'strict': True,
@@ -273,8 +285,11 @@ def _normalize(value, valid, fallback):
     if not value:
         return fallback
     cleaned = str(value).strip()
+    if isinstance(valid, dict):
+        return valid.get(cleaned.lower(), fallback)
+    cleaned_lower = cleaned.lower()
     for option in valid:
-        if cleaned.lower() == option.lower():
+        if cleaned_lower == option.lower():
             return option
     return fallback
 
@@ -352,15 +367,15 @@ class StreamingReplyParser:
     def feed(self, delta):
         self.raw_text += delta
         if not self.emotion:
-            m = re.search(r'"emotion"\s*:\s*"([^"]+)"', self.raw_text)
+            m = _RE_EMOTION.search(self.raw_text)
             if m:
-                self.emotion = _normalize(m.group(1), VALID_EMOTIONS, 'Neutral')
+                self.emotion = _normalize(m.group(1), _VALID_EMOTIONS_MAP, 'Neutral')
         if not self.color:
-            m = re.search(r'"color"\s*:\s*"([^"]+)"', self.raw_text)
+            m = _RE_COLOR.search(self.raw_text)
             if m:
-                self.color = _normalize(m.group(1), VALID_COLORS, 'White')
+                self.color = _normalize(m.group(1), _VALID_COLORS_MAP, 'White')
         if not self.speech_started:
-            m = re.search(r'"speech"\s*:\s*"', self.raw_text)
+            m = _RE_SPEECH_START.search(self.raw_text)
             if m:
                 self.speech_started = True
                 self.speech_buffer = self.raw_text[m.end():]
@@ -371,7 +386,7 @@ class StreamingReplyParser:
         sentences = []
         if self.speech_started and not self.speech_finished:
             while True:
-                end_match = re.search(r'(?<!\\)"', self.speech_buffer)
+                end_match = _RE_UNESCAPED_QUOTE.search(self.speech_buffer)
                 if end_match:
                     self.speech_finished = True
                     part = self.speech_buffer[:end_match.start()].strip()
@@ -388,14 +403,14 @@ class StreamingReplyParser:
                 if not self.first_chunk_sent:
                     # chunk 0: require enough speech buffer (>=3 words or >=14 chars) so audio duration
                     # (~1.5-2.0s) seamlessly hides synthesis of chunk 1, avoiding buffer starvation.
-                    term_match = re.search(r'([.!?]+)\s+', self.speech_buffer)
+                    term_match = _RE_TERMINAL_PUNCT.search(self.speech_buffer)
                     if term_match:
                         cand = self.speech_buffer[:term_match.start(1) + len(term_match.group(1).rstrip())].strip()
                         if len(cand.split()) >= MIN_FIRST_CHUNK_WORDS or len(cand) >= MIN_FIRST_CHUNK_CHARS:
                             split_pos = term_match.end()
                             sentence = cand
                     if split_pos is None:
-                        for cm in re.finditer(r'(?:([;:,])\s+|([—–]|--)\s*)', self.speech_buffer):
+                        for cm in _RE_CLAUSE_PUNCT.finditer(self.speech_buffer):
                             punct = cm.group(1) or cm.group(2)
                             cand = self.speech_buffer[:cm.start() + len(punct)].strip()
                             if len(cand.split()) >= MIN_FIRST_CHUNK_WORDS or len(cand) >= MIN_FIRST_CHUNK_CHARS:
@@ -404,13 +419,13 @@ class StreamingReplyParser:
                                 break
                 else:
                     # subsequent chunks: emit on terminal [.!?] or clause boundaries if >= 4 words
-                    term_match = re.search(r'([.!?]+)\s+', self.speech_buffer)
+                    term_match = _RE_TERMINAL_PUNCT.search(self.speech_buffer)
                     if term_match:
                         cand = self.speech_buffer[:term_match.start(1) + len(term_match.group(1).rstrip())].strip()
                         split_pos = term_match.end()
                         sentence = cand
                     else:
-                        for cm in re.finditer(r'(?:([;:,])\s+|([—–]|--)\s*)', self.speech_buffer):
+                        for cm in _RE_CLAUSE_PUNCT.finditer(self.speech_buffer):
                             punct = cm.group(1) or cm.group(2)
                             cand = self.speech_buffer[:cm.start() + len(punct)].strip()
                             if len(cand.split()) >= MIN_CLAUSE_CHUNK_WORDS:
@@ -431,7 +446,7 @@ class StreamingReplyParser:
     def finish(self):
         if not self.speech_buffer:
             return []
-        leftover = re.sub(r'["\}\s]+$', '', self.speech_buffer).strip()
+        leftover = _RE_LEFTOVER_CLEANUP.sub('', self.speech_buffer).strip()
         leftover = leftover.replace('\\"', '"').replace('\\n', ' ')
         self.speech_buffer = ''
         if leftover and len(leftover) > 1:
