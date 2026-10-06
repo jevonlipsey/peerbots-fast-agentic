@@ -9,11 +9,13 @@ import os
 import time
 import httpx
 import mutagen.mp3
+from rich.console import Console
 
+console = Console()
 
 ### config & endpoints
 DROID_URL = os.environ.get('DROID_URL', 'http://100.119.180.97:8765')
-DEFAULT_CONTENT_TYPE = 'audio/mpeg'
+DEFAULT_CONTENT_TYPE = 'audio/wav'
 DEFAULT_TIMEOUT_S = 6.0
 
 _ASYNC_CLIENT = None
@@ -42,15 +44,36 @@ async def close_client():
 ### duration estimation
 def get_audio_duration_s(audio_bytes):
     """
-    extracts exact playback duration from in-memory mp3 bytes
+    extracts exact playback duration from in-memory wav or mp3 bytes
 
     inputs:
-    audio_bytes: raw mp3 byte stream
+    audio_bytes: raw wav or mp3 byte stream
     outputs:
     duration_s: float seconds or fallback estimate
     """
     if not audio_bytes:
         return 0.0
+
+    # fast path for wav
+    if audio_bytes.startswith(b'RIFF'):
+        try:
+            import wave
+            with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
+                rate = wf.getframerate()
+                ch = wf.getnchannels()
+                width = wf.getsampwidth()
+                byte_rate = rate * ch * width
+                if byte_rate > 0:
+                    # streamed wavs (like kokoro-fastapi) set nframes to 2147483647
+                    data_pos = audio_bytes.find(b'data')
+                    header_offset = data_pos + 8 if data_pos != -1 else 44
+                    actual_data_len = max(0, len(audio_bytes) - header_offset)
+                    return max(0.1, actual_data_len / float(byte_rate))
+        except Exception:
+            # fallback for 24khz 16-bit mono: 48000 bytes/sec
+            return max(0.1, (len(audio_bytes) - 44) / 48000.0)
+
+    # mp3 path
     try:
         mp3 = mutagen.mp3.MP3(io.BytesIO(audio_bytes))
         return float(mp3.info.length)
@@ -95,20 +118,49 @@ async def ais_droid_reachable(timeout=0.6):
         return False
 
 
+async def probe_droid_daemon():
+    """
+    probes droid daemon to inspect supported endpoints and responsiveness
+
+    inputs:
+    none
+    outputs:
+    results: dict of endpoint -> status code or error
+    """
+    endpoints = ['/', '/status', '/stop', '/clear', '/ping']
+    results = {}
+    client = get_async_client()
+    for ep in endpoints:
+        url = f'{DROID_URL.rstrip("/")}{ep}'
+        try:
+            r = await client.get(url, timeout=1.0)
+            results[f'GET {ep}'] = r.status_code
+        except Exception as e:
+            results[f'GET {ep}'] = str(e)
+    return results
+
+
 ### send chunk
-async def asend_audio_chunk(audio_bytes, content_type=DEFAULT_CONTENT_TYPE, timeout=DEFAULT_TIMEOUT_S):
+async def asend_audio_chunk(audio_bytes, content_type=None, timeout=DEFAULT_TIMEOUT_S):
     """
     posts a single in-memory audio chunk to droid daemon
 
     inputs:
     audio_bytes: raw audio stream
-    content_type: mime type (audio/mpeg or audio/wav)
+    content_type: mime type (auto-detects audio/wav or audio/mpeg if None)
     timeout: request timeout
     outputs:
     success: boolean
     """
     if not audio_bytes:
         return False
+
+    if content_type is None:
+        if audio_bytes.startswith(b'RIFF'):
+            content_type = 'audio/wav'
+        else:
+            content_type = 'audio/mpeg'
+
     headers = {'Content-Type': content_type}
     try:
         client = get_async_client()
@@ -130,6 +182,15 @@ class DroidPlaybackQueue:
         self.queue = asyncio.Queue()
         self.worker_task = None
         self.is_playing = False
+        self.expected_idx = 0
+        self.playback_end_time = 0.0
+        self.last_upload_time = 0.12
+
+
+    def reset_turn(self):
+        """resets expected chunk index and playback timing for a new conversational turn"""
+        self.expected_idx = 0
+        self.playback_end_time = 0.0
 
 
     async def start(self):
@@ -153,35 +214,54 @@ class DroidPlaybackQueue:
             except Exception:
                 break
         self.is_playing = False
+        self.expected_idx = 0
         await close_client()
 
 
-    async def enqueue(self, audio_bytes, duration_s=None):
+    async def enqueue(self, audio_bytes, duration_s=None, chunk_idx=None):
         """adds an audio chunk to the sequential playback stream"""
         if duration_s is None:
             duration_s = get_audio_duration_s(audio_bytes)
+        if chunk_idx is not None:
+            if chunk_idx != self.expected_idx:
+                console.print(f'  [dim yellow][[ tts chunk inversion: got #{chunk_idx}, expected #{self.expected_idx} ]][/]')
+            self.expected_idx = chunk_idx + 1
         await self.start()
-        await self.queue.put((audio_bytes, duration_s))
+        await self.queue.put((audio_bytes, duration_s, chunk_idx))
 
 
     async def wait_complete(self):
-        """waits until all queued audio chunks have been sent and played"""
+        """waits until all queued audio chunks have been sent and played completely"""
         await self.queue.join()
-        while self.is_playing:
-            await asyncio.sleep(0.05)
+        # ensure last chunk's audio finishes playing before releasing caller
+        remaining = self.playback_end_time - time.time()
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+        self.is_playing = False
+        self.expected_idx = 0
+        self.playback_end_time = 0.0
 
 
     async def _worker(self):
         """background loop sending chunks sequentially with duration pacing"""
         while True:
-            audio_bytes, duration_s = await self.queue.get()
+            audio_bytes, duration_s, chunk_idx = await self.queue.get()
             self.is_playing = True
             try:
+                t0 = time.perf_counter()
                 ok = await asend_audio_chunk(audio_bytes)
+                t_upload = time.perf_counter() - t0
+                if ok and t_upload > 0:
+                    self.last_upload_time = 0.7 * self.last_upload_time + 0.3 * t_upload
+
                 if ok and duration_s > 0:
-                    # leave a tiny 50ms overlap for gapless speech
-                    sleep_time = max(0.0, duration_s - 0.05)
-                    await asyncio.sleep(sleep_time)
+                    now = time.time()
+                    self.playback_end_time = max(now, self.playback_end_time) + duration_s
+                    # lead time accounts for tailscale upload round-trip for the NEXT chunk
+                    lead_time = min(duration_s * 0.5, self.last_upload_time + 0.02)
+                    target_wake = self.playback_end_time - lead_time
+                    wait_s = max(0.0, target_wake - time.time())
+                    await asyncio.sleep(wait_s)
             except asyncio.CancelledError:
                 self.is_playing = False
                 self.queue.task_done()

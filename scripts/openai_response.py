@@ -34,13 +34,41 @@ MODEL = os.environ.get('OPENAI_MODEL', 'gpt-4.1-nano')
 if USE_LOCAL_LLM:
     MODEL = 'gemma4:e4b'
 
+_CLIENT = None
+
 
 def get_client():
-    # lazy init so importing this module never crashes on missing keys
+    # cached persistent client for low-latency connection reuse
+    global _CLIENT
+    if _CLIENT is None:
+        if USE_LOCAL_LLM:
+            _CLIENT = AsyncOpenAI(base_url=OLLAMA_URL, api_key='ollama')
+        else:
+            key = os.environ.get('OPENAI_API_KEY', '') or OPENAI_API_KEY
+            _CLIENT = AsyncOpenAI(api_key=key)
+    return _CLIENT
+
+
+async def close_client():
+    # close client on shutdown
+    global _CLIENT
+    if _CLIENT is not None:
+        try:
+            await _CLIENT.close()
+        except Exception:
+            pass
+        _CLIENT = None
+
+
+async def prewarm_openai():
+    # warm up dns, tls, and connection pool before the first turn
     if USE_LOCAL_LLM:
-        return AsyncOpenAI(base_url=OLLAMA_URL, api_key='ollama')
-    key = os.environ.get('OPENAI_API_KEY', '') or OPENAI_API_KEY
-    return AsyncOpenAI(api_key=key)
+        return
+    try:
+        client = get_client()
+        await client.models.list()
+    except Exception as e:
+        console.print(f'[dim yellow][[ openai prewarm failed: {e} ]][/]')
 
 
 def _needs_reasoning_none(model):
@@ -79,11 +107,11 @@ REPLY_SCHEMA = {
     'schema': {
         'type': 'object',
         'properties': {
+            'speech': {'type': 'string'},
             'emotion': {'type': 'string', 'enum': VALID_EMOTIONS},
             'color': {'type': 'string', 'enum': VALID_COLORS},
-            'speech': {'type': 'string'},
         },
-        'required': ['emotion', 'color', 'speech'],
+        'required': ['speech', 'emotion', 'color'],
         'additionalProperties': False,
     },
 }
@@ -97,36 +125,68 @@ class peerbots_reply(BaseModel):
 
 
 ### history
+_IN_MEMORY_HISTORY = None
+
+
 def get_history():
-    data = safe_read(HISTORY_FILE)
-    if not data:
-        return []
-    try:
-        parsed = json.loads(data)
-        return parsed if isinstance(parsed, list) else []
-    except Exception as e:
-        console.print(f'[bold red][[ error parsing history: {e} ]][/]')
-        return []
+    # cached in-memory history, loads once from disk
+    global _IN_MEMORY_HISTORY
+    if _IN_MEMORY_HISTORY is None:
+        data = safe_read(HISTORY_FILE)
+        if not data:
+            _IN_MEMORY_HISTORY = []
+        else:
+            try:
+                parsed = json.loads(data)
+                _IN_MEMORY_HISTORY = parsed if isinstance(parsed, list) else []
+            except Exception as e:
+                console.print(f'[bold red][[ error parsing history: {e} ]][/]')
+                _IN_MEMORY_HISTORY = []
+    return list(_IN_MEMORY_HISTORY)
 
 
 def save_history(chat_history):
+    # updates in-memory history immediately and flushes to disk in background thread
+    global _IN_MEMORY_HISTORY
     if len(chat_history) > HISTORY_LENGTH:
         chat_history = chat_history[-HISTORY_LENGTH:]
-    safe_write(HISTORY_FILE, json.dumps(chat_history, indent=2))
+    _IN_MEMORY_HISTORY = list(chat_history)
+    import threading
+    payload = json.dumps(_IN_MEMORY_HISTORY, indent=2)
+    threading.Thread(target=safe_write, args=(HISTORY_FILE, payload), daemon=True).start()
+
+
+_CACHED_PROMPT = None
+_CACHED_PROMPT_MTIME = 0
+_CACHED_SKILLS_MTIME = 0
 
 
 def load_system_prompt():
-    # fresh read each turn so prompt edits apply without restart
+    # cached read, only reloads if prompt file or skills change
+    global _CACHED_PROMPT, _CACHED_PROMPT_MTIME, _CACHED_SKILLS_MTIME
     path = os.path.join(BASE_DIR, 'config', 'system_prompt.md')
-    prompt = safe_read(path)
+    try:
+        mtime = os.path.getmtime(path) if os.path.exists(path) else 0
+    except OSError:
+        mtime = 0
+
+    skill_files = sorted(glob.glob(os.path.join(SKILLS_DIR, '*', 'SKILL.md')))
+    skills_mtime = max([os.path.getmtime(f) for f in skill_files], default=0)
+
+    if _CACHED_PROMPT is not None and mtime == _CACHED_PROMPT_MTIME and skills_mtime == _CACHED_SKILLS_MTIME:
+        return _CACHED_PROMPT
+
+    prompt = safe_read(path) or ''
     if '{CONTEXT_DIR}' in prompt:
         prompt = prompt.replace('{CONTEXT_DIR}', os.path.join(BASE_DIR, 'context'))
-    # optional skills plumbing: every skills/*/SKILL.md is appended verbatim.
-    # no skills installed yet, drop a SKILL.md in skills/ to add one.
-    for skill_file in sorted(glob.glob(os.path.join(SKILLS_DIR, '*', 'SKILL.md'))):
+    for skill_file in skill_files:
         body = safe_read(skill_file)
         if body:
             prompt += f'\n\n---\n\n# skill: {os.path.basename(os.path.dirname(skill_file))}\n\n{body}'
+
+    _CACHED_PROMPT = prompt
+    _CACHED_PROMPT_MTIME = mtime
+    _CACHED_SKILLS_MTIME = skills_mtime
     return prompt
 
 
@@ -222,7 +282,7 @@ def parse_reply(raw_text):
         validated = peerbots_reply(
             speech=str(data.get('speech', '')).strip(),
             emotion=_normalize(data.get('emotion'), VALID_EMOTIONS, 'Neutral'),
-            color=_normalize(data.get('color'), VALID_COLORS, 'Light Blue'),
+            color=_normalize(data.get('color'), VALID_COLORS, 'White'),
         )
     except (ValidationError, AttributeError):
         return _fallback_reply()
@@ -235,11 +295,17 @@ def parse_reply(raw_text):
     }
 
 
+### chunking thresholds
+MIN_FIRST_CHUNK_WORDS = 3
+MIN_FIRST_CHUNK_CHARS = 14
+MIN_CLAUSE_CHUNK_WORDS = 4
+
+
 class StreamingReplyParser:
-    '''
+    """
     incremental parser for structured json:
-    extracts emotion and color early, yields speech sentences on boundaries.
-    '''
+    extracts emotion and color, yields speech clauses on boundaries.
+    """
 
     def __init__(self):
         self.raw_text = ''
@@ -248,6 +314,7 @@ class StreamingReplyParser:
         self.speech_buffer = ''
         self.speech_started = False
         self.speech_finished = False
+        self.first_chunk_sent = False
 
 
     def feed(self, delta):
@@ -259,7 +326,7 @@ class StreamingReplyParser:
         if not self.color:
             m = re.search(r'"color"\s*:\s*"([^"]+)"', self.raw_text)
             if m:
-                self.color = _normalize(m.group(1), VALID_COLORS, 'Light Blue')
+                self.color = _normalize(m.group(1), VALID_COLORS, 'White')
         if not self.speech_started:
             m = re.search(r'"speech"\s*:\s*"', self.raw_text)
             if m:
@@ -279,20 +346,51 @@ class StreamingReplyParser:
                     part = part.replace('\\"', '"').replace('\\n', ' ')
                     if part:
                         sentences.append(part)
+                        self.first_chunk_sent = True
                     self.speech_buffer = ''
                     break
-                # match sentence boundaries (.!?) or natural clause boundaries (;, or comma if 4+ words accumulated)
-                boundary = re.search(r'([.!?]+|[;:])\s+', self.speech_buffer)
-                if not boundary and len(self.speech_buffer.split()) >= 5:
-                    boundary = re.search(r'(,\s+)', self.speech_buffer)
 
-                if boundary:
-                    split_pos = boundary.end()
-                    sentence = self.speech_buffer[:boundary.start(1) + len(boundary.group(1).rstrip())].strip()
+                split_pos = None
+                sentence = None
+
+                if not self.first_chunk_sent:
+                    # chunk 0: require enough speech buffer (>=3 words or >=14 chars) so audio duration
+                    # (~1.5-2.0s) seamlessly hides synthesis of chunk 1, avoiding buffer starvation.
+                    term_match = re.search(r'([.!?]+)\s+', self.speech_buffer)
+                    if term_match:
+                        cand = self.speech_buffer[:term_match.start(1) + len(term_match.group(1).rstrip())].strip()
+                        if len(cand.split()) >= MIN_FIRST_CHUNK_WORDS or len(cand) >= MIN_FIRST_CHUNK_CHARS:
+                            split_pos = term_match.end()
+                            sentence = cand
+                    if split_pos is None:
+                        for cm in re.finditer(r'(?:([;:,])\s+|([—–]|--)\s*)', self.speech_buffer):
+                            punct = cm.group(1) or cm.group(2)
+                            cand = self.speech_buffer[:cm.start() + len(punct)].strip()
+                            if len(cand.split()) >= MIN_FIRST_CHUNK_WORDS or len(cand) >= MIN_FIRST_CHUNK_CHARS:
+                                split_pos = cm.end()
+                                sentence = cand
+                                break
+                else:
+                    # subsequent chunks: emit on terminal [.!?] or clause boundaries if >= 4 words
+                    term_match = re.search(r'([.!?]+)\s+', self.speech_buffer)
+                    if term_match:
+                        cand = self.speech_buffer[:term_match.start(1) + len(term_match.group(1).rstrip())].strip()
+                        split_pos = term_match.end()
+                        sentence = cand
+                    else:
+                        for cm in re.finditer(r'(?:([;:,])\s+|([—–]|--)\s*)', self.speech_buffer):
+                            punct = cm.group(1) or cm.group(2)
+                            cand = self.speech_buffer[:cm.start() + len(punct)].strip()
+                            if len(cand.split()) >= MIN_CLAUSE_CHUNK_WORDS:
+                                split_pos = cm.end()
+                                sentence = cand
+                                break
+
+                if split_pos is not None and sentence:
                     sentence = sentence.replace('\\"', '"').replace('\\n', ' ')
                     self.speech_buffer = self.speech_buffer[split_pos:]
-                    if sentence:
-                        sentences.append(sentence)
+                    sentences.append(sentence)
+                    self.first_chunk_sent = True
                 else:
                     break
         return sentences
@@ -339,7 +437,7 @@ async def stream_peerbots_reply(user_text, tools_list=None, tool_router=None):
     outputs:
     yields event dicts:
     - {'type': 'face', 'emotion': emotion, 'color': color}
-    - {'type': 'sentence', 'text': sentence}
+    - {'type': 'sentence', 'text': sentence, 'idx': chunk_index}
     - {'type': 'final', 'reply': reply_dict, 'metrics': metrics_dict}
     '''
     tools_list = tools_list or []
@@ -358,11 +456,15 @@ async def stream_peerbots_reply(user_text, tools_list=None, tool_router=None):
             if tools_list and not USE_LOCAL_LLM:
                 kwargs['tools'] = tools_list
 
+            t_api_start = time.time()
             stream = await get_client().chat.completions.create(**kwargs)
             parser = StreamingReplyParser()
             accumulated_tool_calls = {}
             face_sent = False
-            ttft_ms = None
+            t_first_token = None
+            t_first_clause = None
+            t_face_sent = None
+            chunk_idx = 0
 
             async for chunk in stream:
                 if not chunk.choices:
@@ -385,14 +487,18 @@ async def stream_peerbots_reply(user_text, tools_list=None, tool_router=None):
                             accumulated_tool_calls[idx]['arguments'] += tc.function.arguments
 
                 if d.content:
-                    if ttft_ms is None:
-                        ttft_ms = int((time.time() - start_t) * 1000)
+                    if t_first_token is None:
+                        t_first_token = time.time()
                     sentences = parser.feed(d.content)
                     if not face_sent and parser.emotion and parser.color:
                         face_sent = True
+                        t_face_sent = time.time()
                         yield {'type': 'face', 'emotion': parser.emotion, 'color': parser.color}
                     for s in sentences:
-                        yield {'type': 'sentence', 'text': s}
+                        if t_first_clause is None:
+                            t_first_clause = time.time()
+                        yield {'type': 'sentence', 'text': s, 'idx': chunk_idx}
+                        chunk_idx += 1
 
             # if tools were invoked during this stream, execute and loop
             if accumulated_tool_calls:
@@ -435,18 +541,30 @@ async def stream_peerbots_reply(user_text, tools_list=None, tool_router=None):
 
             # finalize conversational stream
             for s in parser.finish():
-                yield {'type': 'sentence', 'text': s}
+                if t_first_clause is None:
+                    t_first_clause = time.time()
+                yield {'type': 'sentence', 'text': s, 'idx': chunk_idx}
+                chunk_idx += 1
 
             reply = parse_reply(parser.raw_text)
             if not face_sent:
+                t_face_sent = time.time()
                 yield {'type': 'face', 'emotion': reply['emotion'], 'color': reply['color']}
 
             elapsed_ms = int((time.time() - start_t) * 1000)
+            ttft_ms = int((t_first_token - t_api_start) * 1000) if t_first_token else elapsed_ms
+            first_clause_ms = int((t_first_clause - t_api_start) * 1000) if t_first_clause else 0
+            face_ms = int((t_face_sent - t_api_start) * 1000) if t_face_sent else 0
+            api_total_ms = int((time.time() - t_api_start) * 1000)
+
             yield {
                 'type': 'final',
                 'reply': reply,
                 'metrics': {
-                    'ttft_ms': ttft_ms or elapsed_ms,
+                    'ttft_ms': ttft_ms,
+                    'first_clause_ms': first_clause_ms,
+                    'face_ms': face_ms,
+                    'api_total_ms': api_total_ms,
                     'total_ms': elapsed_ms,
                 },
             }
@@ -456,13 +574,13 @@ async def stream_peerbots_reply(user_text, tools_list=None, tool_router=None):
 
         fallback = _fallback_reply()
         yield {'type': 'face', 'emotion': fallback['emotion'], 'color': fallback['color']}
-        yield {'type': 'sentence', 'text': fallback['speech']}
+        yield {'type': 'sentence', 'text': fallback['speech'], 'idx': 0}
         yield {'type': 'final', 'reply': fallback, 'metrics': {'ttft_ms': 0, 'total_ms': 0}}
     except Exception as e:
         console.print(f'[bold red][[ openai streaming error: {e} ]][/]')
         fallback = _fallback_reply()
         yield {'type': 'face', 'emotion': fallback['emotion'], 'color': fallback['color']}
-        yield {'type': 'sentence', 'text': fallback['speech']}
+        yield {'type': 'sentence', 'text': fallback['speech'], 'idx': 0}
         yield {'type': 'final', 'reply': fallback, 'metrics': {'ttft_ms': 0, 'total_ms': 0}}
 
 

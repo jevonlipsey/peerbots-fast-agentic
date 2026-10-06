@@ -6,9 +6,11 @@ main.py plus the original file-queue daemon mode.
 layer 1: microphone -> whisper_stt -> openai_response
 '''
 
+import atexit
 import os
 import platform
 import random
+import re
 import subprocess
 import sys
 import tempfile
@@ -36,6 +38,18 @@ TRANSCRIPTION_FILE = os.path.join(STATE_DIR, 'transcription.txt')
 MICROPHONE_INDEX = None
 
 IS_MAC = platform.system() == 'Darwin'
+_SWIFT_TMP_WAV = os.path.join(tempfile.gettempdir(), f'lulo_stt_{os.getpid()}.wav')
+
+
+def _cleanup_tmp_wav():
+    try:
+        if os.path.exists(_SWIFT_TMP_WAV):
+            os.unlink(_SWIFT_TMP_WAV)
+    except Exception:
+        pass
+
+
+atexit.register(_cleanup_tmp_wav)
 
 ### short murmurs + whisper hallucinations to ignore
 HALLUCINATIONS = [
@@ -154,20 +168,15 @@ def transcribe_audio(recognizer, audio, swift_proc=None):
     if IS_MAC and swift_proc is not None and swift_proc.poll() is None:
         try:
             wav_data = audio.get_wav_data(convert_rate=16000, convert_width=2)
-            tmp = tempfile.NamedTemporaryFile(suffix='.wav', delete=False)
-            tmp.write(wav_data)
-            tmp.close()
+            with open(_SWIFT_TMP_WAV, 'wb') as f:
+                f.write(wav_data)
             text = None
             try:
-                swift_proc.stdin.write(tmp.name + '\n')
+                swift_proc.stdin.write(_SWIFT_TMP_WAV + '\n')
                 swift_proc.stdin.flush()
                 text = swift_proc.stdout.readline().strip()
             except BrokenPipeError:
                 text = None
-            try:
-                os.unlink(tmp.name)
-            except Exception:
-                pass
             if text is not None:
                 # coreml processed the audio cleanly without crashing.
                 # if text is empty, the audio was silence/room noise; do not fall through to cpu whisper
@@ -194,9 +203,40 @@ def transcribe_audio(recognizer, audio, swift_proc=None):
         return '', swift_proc
 
 
+CONTINUATION_CUES = {
+    'and',
+    'but',
+    'or',
+    'so',
+    'because',
+    'like',
+    'um',
+    'uh',
+    'uhh',
+    'umm',
+    'then',
+    'if',
+    'with',
+    'when',
+}
+
+
+def _ends_with_continuation(text):
+    if not text:
+        return False
+    t = text.strip()
+    if t.endswith(('...', '…', '—', '--', ',')):
+        return True
+    words = t.split()
+    if not words:
+        return False
+    last_word = re.sub(r'^[^\w]+|[^\w]+$', '', words[-1].lower())
+    return last_word in CONTINUATION_CUES
+
+
 def listen_once(recognizer, source, swift_proc=None, timeout=None, phrase_limit=20):
     '''
-    block for one complete utterance, return clean text or empty string.
+    block for one complete utterance with adaptive continuation endpointing.
 
     inputs:
     recognizer: active speech_recognition recognizer
@@ -215,7 +255,23 @@ def listen_once(recognizer, source, swift_proc=None, timeout=None, phrase_limit=
     text, _ = transcribe_audio(recognizer, audio, swift_proc)
     if is_hallucination(text):
         return ''
-    return text.strip()
+    text = text.strip()
+
+    # adaptive endpointing: if user paused on a continuation cue, give a quick bonus window
+    extensions = 0
+    while text and _ends_with_continuation(text) and extensions < 2:
+        try:
+            extra_audio = recognizer.listen(source, timeout=1.2, phrase_time_limit=10)
+            extra_text, _ = transcribe_audio(recognizer, extra_audio, swift_proc)
+            if extra_text and not is_hallucination(extra_text):
+                text = f'{text} {extra_text.strip()}'.strip()
+                extensions += 1
+            else:
+                break
+        except (sr.WaitTimeoutError, Exception):
+            break
+
+    return text
 
 
 ## daemon mode (original file-queue pipeline)
@@ -230,7 +286,8 @@ def main():
         console.print('[dim white][[STT_WORKER]]: python whisper fallback ready[/]')
 
     r = sr.Recognizer()
-    r.pause_threshold = 0.85
+    r.pause_threshold = 0.8
+    r.non_speaking_duration = 0.3
 
     with sr.Microphone(device_index=MICROPHONE_INDEX) as source:
         if getattr(source, 'stream', None) is None:

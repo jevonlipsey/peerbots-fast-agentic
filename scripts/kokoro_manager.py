@@ -16,12 +16,14 @@ KOKORO_BASE_URL = os.environ.get('KOKORO_BASE_URL', 'http://localhost:8880')
 KOKORO_DIR = os.path.expanduser(os.environ.get('KOKORO_DIR', '~/Kokoro-FastAPI'))
 DEFAULT_VOICE = 'af_heart:0.6+af_bella:0.4'
 DEFAULT_SPEED = 1.05
-AUDIO_FORMAT = 'mp3'
+AUDIO_FORMAT = os.environ.get('AUDIO_FORMAT', 'wav')
 START_TIMEOUT_S = 18.0
+MAX_CACHE_ENTRIES = 50
 
 _KOKORO_PROC = None
 _STARTED_BY_US = False
 _ASYNC_CLIENT = None
+_TTS_CACHE = {}
 
 
 def get_async_client():
@@ -107,7 +109,7 @@ async def ais_kokoro_running(timeout=0.6):
 
 def start_kokoro_process():
     """
-    spawns start-gpu_mac.sh in the background if kokoro dir exists
+    spawns start-cpu_mac.sh (or start-gpu_mac.sh fallback) in the background if kokoro dir exists
 
     inputs:
     none
@@ -115,7 +117,9 @@ def start_kokoro_process():
     proc: subprocess.Popen or None
     """
     global _KOKORO_PROC, _STARTED_BY_US
-    script_path = os.path.join(KOKORO_DIR, 'start-gpu_mac.sh')
+    cpu_script = os.path.join(KOKORO_DIR, 'start-cpu_mac.sh')
+    gpu_script = os.path.join(KOKORO_DIR, 'start-gpu_mac.sh')
+    script_path = cpu_script if os.path.isfile(cpu_script) else gpu_script
     if not os.path.isfile(script_path):
         return None
     try:
@@ -132,6 +136,16 @@ def start_kokoro_process():
         return proc
     except Exception:
         return None
+
+
+PREWARM_PHRASES = [
+    'hello there',
+    'awesome,',
+    'great,',
+    'sounds good!',
+    "let's do it!",
+    "you got this!",
+]
 
 
 async def ensure_kokoro_ready(timeout=START_TIMEOUT_S):
@@ -163,11 +177,19 @@ async def ensure_kokoro_ready(timeout=START_TIMEOUT_S):
             await asyncio.sleep(0.5)
 
     if ready:
-        # warm up kokoro mps pipeline in background so first spoken turn is instant (~300ms)
-        try:
-            await synthesize_speech('warmup')
-        except Exception:
-            pass
+        # warm up kokoro pipeline & seed cache with common conversational phrases concurrently
+        await asyncio.gather(
+            *(
+                synthesize_speech(
+                    phrase,
+                    voice=DEFAULT_VOICE,
+                    speed=DEFAULT_SPEED,
+                    response_format=AUDIO_FORMAT,
+                )
+                for phrase in PREWARM_PHRASES
+            ),
+            return_exceptions=True,
+        )
     return ready
 
 
@@ -204,7 +226,7 @@ def stop_kokoro_process():
 ### synthesis
 async def synthesize_speech(text, voice=DEFAULT_VOICE, speed=DEFAULT_SPEED, response_format=AUDIO_FORMAT):
     """
-    synthesizes speech in memory via kokoro fastapi /v1/audio/speech
+    synthesizes speech in memory via kokoro fastapi /v1/audio/speech with exact-repeat caching
 
     inputs:
     text: sentence to speak
@@ -214,11 +236,16 @@ async def synthesize_speech(text, voice=DEFAULT_VOICE, speed=DEFAULT_SPEED, resp
     outputs:
     audio_bytes: raw in-memory audio bytes or None if synthesis failed
     """
+    global _TTS_CACHE
     cleaned = text.strip()
     if not cleaned:
         return None
 
     norm_voice = normalize_kokoro_voice(voice)
+    cache_key = f'{cleaned.lower()}|{norm_voice}|{speed}|{response_format}'
+    if cache_key in _TTS_CACHE:
+        return _TTS_CACHE[cache_key]
+
     url = f'{KOKORO_BASE_URL.rstrip("/")}/v1/audio/speech'
     payload = {
         'model': 'kokoro',
@@ -232,7 +259,11 @@ async def synthesize_speech(text, voice=DEFAULT_VOICE, speed=DEFAULT_SPEED, resp
         client = get_async_client()
         resp = await client.post(url, json=payload)
         if resp.status_code == 200:
-            return resp.content
+            audio_bytes = resp.content
+            if len(_TTS_CACHE) >= MAX_CACHE_ENTRIES:
+                _TTS_CACHE.pop(next(iter(_TTS_CACHE)))
+            _TTS_CACHE[cache_key] = audio_bytes
+            return audio_bytes
         return None
     except Exception:
         return None
