@@ -60,6 +60,9 @@ VALID_COLORS = [
     'Black',
 ]
 
+_VALID_EMOTIONS_MAP = {e.lower(): e for e in VALID_EMOTIONS}
+_VALID_COLORS_MAP = {c.lower(): c for c in VALID_COLORS}
+
 
 ### util
 def _normalize(value, valid, fallback):
@@ -67,10 +70,17 @@ def _normalize(value, valid, fallback):
     if not value:
         return fallback
     cleaned = str(value).strip()
+    if isinstance(valid, dict):
+        return valid.get(cleaned.lower(), fallback)
+    cleaned_lower = cleaned.lower()
     for option in valid:
-        if cleaned.lower() == option.lower():
+        if cleaned_lower == option.lower():
             return option
     return fallback
+
+
+def _get_send_url(username):
+    return f'{PEERBOTS_BASE_URL}/send-message/{username}'
 
 
 def _headers():
@@ -97,8 +107,8 @@ def send_peerbots_message(speech='', emotion='Neutral', color=DEFAULT_COLOR, sil
     if not (os.environ.get('PEERBOTS_API_KEY', '') or PEERBOTS_API_KEY):
         raise ValueError('PEERBOTS_API_KEY is not set. check your .env file.')
 
-    safe_emotion = _normalize(emotion, VALID_EMOTIONS, 'Neutral')
-    safe_color = _normalize(color, VALID_COLORS, DEFAULT_COLOR)
+    safe_emotion = _normalize(emotion, _VALID_EMOTIONS_MAP, 'Neutral')
+    safe_color = _normalize(color, _VALID_COLORS_MAP, DEFAULT_COLOR)
     text = (speech or '').strip()
 
     title = (text[:60] if len(text) <= 60 else text[:57] + '...') if text else 'Face Update'
@@ -112,7 +122,7 @@ def send_peerbots_message(speech='', emotion='Neutral', color=DEFAULT_COLOR, sil
     }
 
     timeout = SILENT_TIMEOUT_S if silent else DEFAULT_TIMEOUT_S
-    url = f'{PEERBOTS_BASE_URL}/send-message/{username}'
+    url = _get_send_url(username)
     with httpx.Client(timeout=timeout) as client:
         resp = client.post(url, headers=_headers(), json=payload)
         resp.raise_for_status()
@@ -138,8 +148,8 @@ async def asend_peerbots_message(speech='', emotion='Neutral', color=DEFAULT_COL
     if not (os.environ.get('PEERBOTS_API_KEY', '') or PEERBOTS_API_KEY):
         return None
 
-    safe_emotion = _normalize(emotion, VALID_EMOTIONS, 'Neutral')
-    safe_color = _normalize(color, VALID_COLORS, DEFAULT_COLOR)
+    safe_emotion = _normalize(emotion, _VALID_EMOTIONS_MAP, 'Neutral')
+    safe_color = _normalize(color, _VALID_COLORS_MAP, DEFAULT_COLOR)
     text = (speech or '').strip()
 
     title = (text[:60] if len(text) <= 60 else text[:57] + '...') if text else 'Face Update'
@@ -153,7 +163,7 @@ async def asend_peerbots_message(speech='', emotion='Neutral', color=DEFAULT_COL
     }
 
     timeout = SILENT_TIMEOUT_S if silent else DEFAULT_TIMEOUT_S
-    url = f'{PEERBOTS_BASE_URL}/send-message/{username}'
+    url = _get_send_url(username)
     try:
         client = get_async_client()
         resp = await client.post(url, headers=_headers(), json=payload, timeout=timeout)

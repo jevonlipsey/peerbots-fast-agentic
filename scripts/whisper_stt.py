@@ -237,6 +237,19 @@ def _ends_with_continuation(text):
 
 ### silero vad neural endpointing
 _VAD_MODEL = None
+_NP = None
+_TORCH = None
+
+
+def _get_stt_math():
+    global _NP, _TORCH
+    if _NP is None:
+        import numpy as np
+        _NP = np
+    if _TORCH is None:
+        import torch
+        _TORCH = torch
+    return _NP, _TORCH
 
 
 def get_vad_model():
@@ -274,13 +287,11 @@ def listen_audio_silero(
     outputs:
     AudioData instance
     '''
-    import numpy as np
-    import torch
-
     vad_model = get_vad_model()
     if vad_model is None:
         raise RuntimeError('silero vad model unavailable')
 
+    np, torch = _get_stt_math()
     vad_model.reset_states()
 
     sample_rate = getattr(source, 'SAMPLE_RATE', 16000)

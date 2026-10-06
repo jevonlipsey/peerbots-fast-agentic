@@ -16,3 +16,9 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Change: Replaced dynamic `wave.open(io.BytesIO(...))` and inner `import wave` with `struct.unpack_from('<HII', audio_bytes, 22)` for direct in-memory byte_rate extraction in 0.5 microseconds without object allocation. Precomputed static URLs `KOKORO_SPEECH_URL` and `KOKORO_DOCS_URL`. Added in-memory `_VOICE_CACHE` for Kokoro voice mixture strings.
 - Result: All tests passed, test suite runtime reduced from 0.94s to 0.86s.
 - TTFA_MS: ~893.64ms (clean, zero memory allocations in audio parsing hot-path).
+
+## Iteration 3: Peerbots Client Map Lookups & Lazy STT Math Imports
+- Files: `scripts/peerbots_client.py`, `scripts/whisper_stt.py`
+- Change: Implemented `_VALID_EMOTIONS_MAP` and `_VALID_COLORS_MAP` in `peerbots_client.py` for O(1) face state normalization. Cached endpoint URL formatting in `_get_send_url(username)`. Replaced repeated in-loop imports of `numpy` and `torch` in `listen_audio_silero` with module-level lazy references `_get_stt_math()`.
+- Result: All tests passed, clean hot-path normalization and zero repeated import overhead in VAD loop.
+- TTFA_MS: ~894.14ms.
