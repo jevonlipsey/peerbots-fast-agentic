@@ -47,3 +47,10 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Result: All tests passed, Droid dispatch span reduced to ~30.1ms.
 - TTFA_MS: ~888.28ms.
 
+## Iteration 8: Guard Streaming Face Regexes During Speech & Cache Response Format
+- Files: `scripts/openai_response.py`
+- Change: Eliminated redundant `_RE_EMOTION` and `_RE_COLOR` regex searches across the token stream while speech is actively being emitted (`not speech_started or speech_finished`), saving dozens of regex evaluations during streaming. Precomputed `_MODEL_NEEDS_REASONING_NONE` and `_RESPONSE_FORMAT` once at module level. Added `maxsplit=3` in `_record_turn_metadata`.
+- Result: All test harness and flow assertions passed. Clean execution with reduced CPU overhead per delta.
+- TTFA_MS: ~893.33ms.
+
+

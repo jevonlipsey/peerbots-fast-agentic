@@ -145,6 +145,7 @@ def start_kokoro_process():
 
 
 PREWARM_PHRASES = [
+    'Hey! How are you doing today?',
     'hello there',
     'awesome,',
     'great,',
@@ -248,7 +249,7 @@ async def synthesize_speech(text, voice=DEFAULT_VOICE, speed=DEFAULT_SPEED, resp
         return None
 
     norm_voice = normalize_kokoro_voice(voice)
-    cache_key = f'{cleaned.lower()}|{norm_voice}|{speed}|{response_format}'
+    cache_key = (cleaned.lower(), norm_voice, speed, response_format)
     if cache_key in _TTS_CACHE:
         return _TTS_CACHE[cache_key]
 
