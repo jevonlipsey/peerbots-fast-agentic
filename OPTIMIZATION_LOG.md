@@ -89,6 +89,12 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Result: Microbenchmark shows >50% CPU reduction in frame tensor preparation (saved ~16.95ms per 20k frames), TTFA_MS dropped to 891.59ms. All harness assertions and tests passed.
 - TTFA_MS: 891.59ms (-0.91ms).
 
+## Iteration 15: Synchronous Worker Priming & Zero-Await Put in Droid Playback Queue
+- Files: `scripts/droid_client.py`
+- Change: Added `ensure_worker()` to prime background queue worker synchronously at `reset_turn()`, replaced coroutine `await self.queue.put(...)` with instant `self.queue.put_nowait(...)`, and bypassed per-chunk `httpx.Timeout` re-allocation in `asend_audio_chunk`.
+- Result: Clean pipeline execution, pytest suite passed in 0.86s, all harness assertions passed.
+- TTFA_MS: 887.15ms.
+
 
 
 

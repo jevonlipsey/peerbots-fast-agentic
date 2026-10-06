@@ -69,7 +69,7 @@ def get_audio_duration_s(audio_bytes):
                     data_pos = audio_bytes.find(b'data')
                     header_offset = data_pos + 8 if data_pos != -1 else 44
                 actual_data_len = max(0, len(audio_bytes) - header_offset)
-                return max(0.1, actual_data_len / float(byte_rate))
+                return max(0.1, actual_data_len / byte_rate)
         except Exception:
             pass
         # fallback for 24khz 16-bit mono: 48000 bytes/sec
@@ -167,7 +167,10 @@ async def asend_audio_chunk(audio_bytes, content_type=None, timeout=DEFAULT_TIME
         headers = {'Content-Type': content_type}
     try:
         client = get_async_client()
-        resp = await client.post(DROID_URL, content=audio_bytes, headers=headers, timeout=timeout)
+        if timeout is None or timeout == DEFAULT_TIMEOUT_S:
+            resp = await client.post(DROID_URL, content=audio_bytes, headers=headers)
+        else:
+            resp = await client.post(DROID_URL, content=audio_bytes, headers=headers, timeout=timeout)
         return resp.status_code == 200
     except Exception:
         return False
@@ -190,16 +193,22 @@ class DroidPlaybackQueue:
         self.last_upload_time = 0.12
 
 
+    def ensure_worker(self):
+        """ensures background worker is running without coroutine overhead"""
+        if self.worker_task is None or self.worker_task.done():
+            self.worker_task = asyncio.create_task(self._worker())
+
+
     def reset_turn(self):
         """resets expected chunk index and playback timing for a new conversational turn"""
         self.expected_idx = 0
         self.playback_end_time = 0.0
+        self.ensure_worker()
 
 
     async def start(self):
         """starts background worker if not already running"""
-        if self.worker_task is None or self.worker_task.done():
-            self.worker_task = asyncio.create_task(self._worker())
+        self.ensure_worker()
 
 
     async def stop(self):
@@ -216,6 +225,7 @@ class DroidPlaybackQueue:
                 self.queue.get_nowait()
             except Exception:
                 break
+            self.queue.task_done()
         self.is_playing = False
         self.expected_idx = 0
         await close_client()
@@ -229,8 +239,8 @@ class DroidPlaybackQueue:
             if chunk_idx != self.expected_idx:
                 console.print(f'  [dim yellow][[ tts chunk inversion: got #{chunk_idx}, expected #{self.expected_idx} ]][/]')
             self.expected_idx = chunk_idx + 1
-        await self.start()
-        await self.queue.put((audio_bytes, duration_s, chunk_idx))
+        self.ensure_worker()
+        self.queue.put_nowait((audio_bytes, duration_s, chunk_idx))
 
 
     async def wait_complete(self):
