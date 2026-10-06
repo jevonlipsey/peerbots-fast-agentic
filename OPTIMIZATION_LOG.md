@@ -40,3 +40,10 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Change: Added `_audio_to_wav_bytes` with direct 44-byte binary RIFF WAV header generation, bypassing `io.BytesIO` and `wave.open` overhead when sending audio to Swift CoreML worker. Cached `vad_model` reference across `listen_once` adaptive extensions, and replaced float division with multiplication in silero audio frame conversion.
 - Result: All tests passed, pytest execution time reduced to 0.84s.
 - TTFA_MS: ~887.42ms.
+
+## Iteration 7: Static HTTP Headers & Fast-Path WAV Header Offset in Droid Client
+- Files: `scripts/droid_client.py`
+- Change: Pre-allocated static headers `_HEADERS_WAV` and `_HEADERS_MP3` in `asend_audio_chunk`, eliminating dict creation on every chunk upload. Optimized `get_audio_duration_s` by fast-checking `audio_bytes[36:40] == b'data'` to set `header_offset = 44` directly instead of scanning the full buffer with `.find(b'data')`.
+- Result: All tests passed, Droid dispatch span reduced to ~30.1ms.
+- TTFA_MS: ~888.28ms.
+

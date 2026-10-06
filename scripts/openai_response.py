@@ -160,6 +160,12 @@ REPLY_SCHEMA = {
     },
 }
 
+_MODEL_NEEDS_REASONING_NONE = _needs_reasoning_none(MODEL)
+_RESPONSE_FORMAT = {
+    'type': 'json_schema',
+    'json_schema': REPLY_SCHEMA,
+}
+
 
 class peerbots_reply(BaseModel):
     # strict shape the face api needs
@@ -381,14 +387,17 @@ class StreamingReplyParser:
 
     def feed(self, delta):
         self.raw_text += delta
-        if not self.emotion:
-            m = _RE_EMOTION.search(self.raw_text)
-            if m:
-                self.emotion = _normalize(m.group(1), _VALID_EMOTIONS_MAP, 'Neutral')
-        if not self.color:
-            m = _RE_COLOR.search(self.raw_text)
-            if m:
-                self.color = _normalize(m.group(1), _VALID_COLORS_MAP, 'White')
+        should_check_face = (not self.speech_started) or self.speech_finished
+        if should_check_face:
+            if not self.emotion:
+                m = _RE_EMOTION.search(self.raw_text)
+                if m:
+                    self.emotion = _normalize(m.group(1), _VALID_EMOTIONS_MAP, 'Neutral')
+            if not self.color:
+                m = _RE_COLOR.search(self.raw_text)
+                if m:
+                    self.color = _normalize(m.group(1), _VALID_COLORS_MAP, 'White')
+
         if not self.speech_started:
             m = _RE_SPEECH_START.search(self.raw_text)
             if m:
@@ -410,6 +419,14 @@ class StreamingReplyParser:
                         sentences.append(part)
                         self.first_chunk_sent = True
                     self.speech_buffer = ''
+                    if not self.emotion:
+                        m = _RE_EMOTION.search(self.raw_text)
+                        if m:
+                            self.emotion = _normalize(m.group(1), _VALID_EMOTIONS_MAP, 'Neutral')
+                    if not self.color:
+                        m = _RE_COLOR.search(self.raw_text)
+                        if m:
+                            self.color = _normalize(m.group(1), _VALID_COLORS_MAP, 'White')
                     break
 
                 split_pos = None
@@ -512,7 +529,7 @@ def _build_session_prefix():
 def _record_turn_metadata(speech, emotion):
     global _RECENT_OPENERS, _RECENT_EMOTIONS
     if speech:
-        words = speech.strip().split()
+        words = speech.strip().split(maxsplit=3)
         if words:
             opener = ' '.join(words[:min(3, len(words))])
             _RECENT_OPENERS.append(opener)
@@ -535,12 +552,9 @@ def _base_kwargs(messages):
     if USE_LOCAL_LLM:
         kwargs['extra_body'] = {'options': {'num_ctx': 4096}, 'format': 'json'}
     else:
-        if _needs_reasoning_none(MODEL):
+        if _MODEL_NEEDS_REASONING_NONE:
             kwargs['reasoning_effort'] = 'none'
-        kwargs['response_format'] = {
-            'type': 'json_schema',
-            'json_schema': REPLY_SCHEMA,
-        }
+        kwargs['response_format'] = _RESPONSE_FORMAT
     return kwargs
 
 
