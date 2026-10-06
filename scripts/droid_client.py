@@ -18,6 +18,8 @@ console = Console()
 DROID_URL = os.environ.get('DROID_URL', 'http://100.119.180.97:8765')
 DEFAULT_CONTENT_TYPE = 'audio/wav'
 DEFAULT_TIMEOUT_S = 6.0
+_HEADERS_WAV = {'Content-Type': 'audio/wav'}
+_HEADERS_MP3 = {'Content-Type': 'audio/mpeg'}
 
 _ASYNC_CLIENT = None
 
@@ -61,8 +63,11 @@ def get_audio_duration_s(audio_bytes):
             ch, rate, byte_rate = struct.unpack_from('<HII', audio_bytes, 22)
             if byte_rate > 0:
                 # streamed wavs (like kokoro-fastapi) set nframes to 2147483647
-                data_pos = audio_bytes.find(b'data')
-                header_offset = data_pos + 8 if data_pos != -1 else 44
+                if len(audio_bytes) >= 44 and audio_bytes[36:40] == b'data':
+                    header_offset = 44
+                else:
+                    data_pos = audio_bytes.find(b'data')
+                    header_offset = data_pos + 8 if data_pos != -1 else 44
                 actual_data_len = max(0, len(audio_bytes) - header_offset)
                 return max(0.1, actual_data_len / float(byte_rate))
         except Exception:
@@ -153,12 +158,13 @@ async def asend_audio_chunk(audio_bytes, content_type=None, timeout=DEFAULT_TIME
         return False
 
     if content_type is None:
-        if audio_bytes.startswith(b'RIFF'):
-            content_type = 'audio/wav'
-        else:
-            content_type = 'audio/mpeg'
-
-    headers = {'Content-Type': content_type}
+        headers = _HEADERS_WAV if audio_bytes.startswith(b'RIFF') else _HEADERS_MP3
+    elif content_type == 'audio/wav':
+        headers = _HEADERS_WAV
+    elif content_type == 'audio/mpeg':
+        headers = _HEADERS_MP3
+    else:
+        headers = {'Content-Type': content_type}
     try:
         client = get_async_client()
         resp = await client.post(DROID_URL, content=audio_bytes, headers=headers, timeout=timeout)
