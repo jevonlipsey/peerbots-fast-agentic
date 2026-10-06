@@ -95,6 +95,13 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Result: Clean pipeline execution, pytest suite passed in 0.86s, all harness assertions passed.
 - TTFA_MS: 887.15ms.
 
+## Iteration 16: Fast-Path C Memchr Closing Quote & Direct Match Group End Slicing
+- Files: `scripts/openai_response.py`
+- Change: Bypassed regex engine for closing speech quote detection with SIMD `str.find('"')` when no escape backslashes exist (9.4x microbenchmark speedup). Replaced redundant `.rstrip()` and `len()` additions with direct match group end offsets `term_match.end(1)` and `cm.end(1 if cm.group(1) else 2)` in StreamingReplyParser.
+- Result: All test harness and flow assertions passed cleanly. Average TTFA dropped to 886.69ms.
+- TTFA_MS: 886.69ms (-0.13ms).
+
+
 
 
 

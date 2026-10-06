@@ -411,10 +411,17 @@ class StreamingReplyParser:
         sentences = []
         if self.speech_started and not self.speech_finished:
             while True:
-                end_match = _RE_UNESCAPED_QUOTE.search(self.speech_buffer) if '"' in self.speech_buffer else None
-                if end_match:
+                quote_pos = -1
+                if '"' in self.speech_buffer:
+                    if '\\' not in self.speech_buffer:
+                        quote_pos = self.speech_buffer.find('"')
+                    else:
+                        m = _RE_UNESCAPED_QUOTE.search(self.speech_buffer)
+                        quote_pos = m.start() if m else -1
+
+                if quote_pos != -1:
                     self.speech_finished = True
-                    part = self.speech_buffer[:end_match.start()].strip()
+                    part = self.speech_buffer[:quote_pos].strip()
                     if '\\' in part:
                         part = part.replace('\\"', '"').replace('\\n', ' ')
                     if part:
@@ -446,14 +453,13 @@ class StreamingReplyParser:
                     # (~1.5-2.0s) seamlessly hides synthesis of chunk 1, avoiding buffer starvation.
                     term_match = _RE_TERMINAL_PUNCT.search(self.speech_buffer) if has_term else None
                     if term_match:
-                        cand = self.speech_buffer[:term_match.start(1) + len(term_match.group(1).rstrip())].strip()
+                        cand = self.speech_buffer[:term_match.end(1)].strip()
                         if _has_min_words(cand, MIN_FIRST_CHUNK_WORDS) or len(cand) >= MIN_FIRST_CHUNK_CHARS:
                             split_pos = term_match.end()
                             sentence = cand
                     if split_pos is None and has_clause:
                         for cm in _RE_CLAUSE_PUNCT.finditer(self.speech_buffer):
-                            punct = cm.group(1) or cm.group(2)
-                            cand = self.speech_buffer[:cm.start() + len(punct)].strip()
+                            cand = self.speech_buffer[:cm.end(1 if cm.group(1) else 2)].strip()
                             if _has_min_words(cand, MIN_FIRST_CHUNK_WORDS) or len(cand) >= MIN_FIRST_CHUNK_CHARS:
                                 split_pos = cm.end()
                                 sentence = cand
@@ -462,13 +468,12 @@ class StreamingReplyParser:
                     # subsequent chunks: emit on terminal [.!?] or clause boundaries if >= 4 words
                     term_match = _RE_TERMINAL_PUNCT.search(self.speech_buffer) if has_term else None
                     if term_match:
-                        cand = self.speech_buffer[:term_match.start(1) + len(term_match.group(1).rstrip())].strip()
+                        cand = self.speech_buffer[:term_match.end(1)].strip()
                         split_pos = term_match.end()
                         sentence = cand
                     elif has_clause:
                         for cm in _RE_CLAUSE_PUNCT.finditer(self.speech_buffer):
-                            punct = cm.group(1) or cm.group(2)
-                            cand = self.speech_buffer[:cm.start() + len(punct)].strip()
+                            cand = self.speech_buffer[:cm.end(1 if cm.group(1) else 2)].strip()
                             if _has_min_words(cand, MIN_CLAUSE_CHUNK_WORDS):
                                 split_pos = cm.end()
                                 sentence = cand
