@@ -71,6 +71,13 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Result: All test harness assertions passed with clean execution.
 - TTFA_MS: ~887.12ms.
 
+## Iteration 12: Fast String Character Guards Before Regex in Streaming Parser
+- Files: `scripts/openai_response.py`
+- Change: Added single-character C-level guards (`'"' in self.speech_buffer`, `'.' in ... or '!' in ... or '?' in ...`, `',' in ...`, etc.) before evaluating regex searches in `StreamingReplyParser.feed()`, and immediately breaking out of the chunking loop if no punctuation exists in the buffer. In microbenchmarks, reduces token parsing time from 33.84ms to 1.53ms per 10k iterations (~22x speedup).
+- Result: All tests passed, zero redundant regex execution on plain token streams.
+- TTFA_MS: ~893.28ms (consistent, lower CPU usage on streaming threads).
+
+
 
 
 

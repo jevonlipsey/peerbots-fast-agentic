@@ -320,6 +320,9 @@ def listen_audio_silero(
     start_time = time.time()
     nodded = {10: False, 25: False, 45: False}
 
+    float_buf = np.empty(512, dtype=np.float32)
+    inv_scale = np.float32(1.0 / 32768.0)
+
     raw_buffer = bytearray()
     stream = getattr(source, 'stream', None)
     if stream is None:
@@ -336,7 +339,8 @@ def listen_audio_silero(
             del raw_buffer[:1024]
 
             audio_int16 = np.frombuffer(frame_bytes, dtype=np.int16)
-            audio_float = torch.from_numpy(audio_int16.astype(np.float32) * (1.0 / 32768.0))
+            np.multiply(audio_int16, inv_scale, out=float_buf)
+            audio_float = torch.from_numpy(float_buf)
 
             prob = vad_model(audio_float, 16000).item()
 

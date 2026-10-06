@@ -5,6 +5,7 @@ which forwards it to the phone running the peerbots face panel.
 layer 3: llm json -> peerbots_client -> face phone
 '''
 
+import asyncio
 import os
 
 import httpx
@@ -79,14 +80,28 @@ def _normalize(value, valid, fallback):
     return fallback
 
 
+_CACHED_USERNAME = None
+_CACHED_URL = None
+_CACHED_API_KEY = None
+_CACHED_HEADERS = None
+
+
 def _get_send_url(username):
-    return f'{PEERBOTS_BASE_URL}/send-message/{username}'
+    global _CACHED_USERNAME, _CACHED_URL
+    if username != _CACHED_USERNAME or _CACHED_URL is None:
+        _CACHED_USERNAME = username
+        _CACHED_URL = f'{PEERBOTS_BASE_URL}/send-message/{username}'
+    return _CACHED_URL
 
 
 def _headers():
-    # read the key fresh so .env edits apply without a restart
+    global _CACHED_API_KEY, _CACHED_HEADERS
+    # read the key fresh so .env edits apply without a restart, but cache dict when unchanged
     key = os.environ.get('PEERBOTS_API_KEY', '') or PEERBOTS_API_KEY
-    return {'Accept': 'application/json', 'X-API-KEY': key}
+    if key != _CACHED_API_KEY or _CACHED_HEADERS is None:
+        _CACHED_API_KEY = key
+        _CACHED_HEADERS = {'Accept': 'application/json', 'X-API-KEY': key}
+    return _CACHED_HEADERS
 
 
 def send_peerbots_message(speech='', emotion='Neutral', color=DEFAULT_COLOR, silent=False):
@@ -178,7 +193,6 @@ async def asend_peerbots_message(speech='', emotion='Neutral', color=DEFAULT_COL
 
 def fire_peerbots_update(speech='', emotion='Neutral', color=DEFAULT_COLOR, silent=True):
     """safely schedule a background face update without blocking caller or leaking exceptions"""
-    import asyncio
     try:
         loop = asyncio.get_running_loop()
         return loop.create_task(asend_peerbots_message(speech=speech, emotion=emotion, color=color, silent=silent))
