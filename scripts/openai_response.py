@@ -389,20 +389,21 @@ class StreamingReplyParser:
         self.raw_text += delta
         should_check_face = (not self.speech_started) or self.speech_finished
         if should_check_face and (not self.emotion or not self.color):
-            if not self.emotion:
+            if not self.emotion and 'emotion' in self.raw_text:
                 m = _RE_EMOTION.search(self.raw_text)
                 if m:
                     self.emotion = _normalize(m.group(1), _VALID_EMOTIONS_MAP, 'Neutral')
-            if not self.color:
+            if not self.color and 'color' in self.raw_text:
                 m = _RE_COLOR.search(self.raw_text)
                 if m:
                     self.color = _normalize(m.group(1), _VALID_COLORS_MAP, 'White')
 
         if not self.speech_started:
-            m = _RE_SPEECH_START.search(self.raw_text)
-            if m:
-                self.speech_started = True
-                self.speech_buffer = self.raw_text[m.end():]
+            if 'speech' in self.raw_text:
+                m = _RE_SPEECH_START.search(self.raw_text)
+                if m:
+                    self.speech_started = True
+                    self.speech_buffer = self.raw_text[m.end():]
         else:
             if not self.speech_finished:
                 self.speech_buffer += delta
@@ -410,7 +411,7 @@ class StreamingReplyParser:
         sentences = []
         if self.speech_started and not self.speech_finished:
             while True:
-                end_match = _RE_UNESCAPED_QUOTE.search(self.speech_buffer)
+                end_match = _RE_UNESCAPED_QUOTE.search(self.speech_buffer) if '"' in self.speech_buffer else None
                 if end_match:
                     self.speech_finished = True
                     part = self.speech_buffer[:end_match.start()].strip()
@@ -420,14 +421,21 @@ class StreamingReplyParser:
                         sentences.append(part)
                         self.first_chunk_sent = True
                     self.speech_buffer = ''
-                    if not self.emotion:
+                    if not self.emotion and 'emotion' in self.raw_text:
                         m = _RE_EMOTION.search(self.raw_text)
                         if m:
                             self.emotion = _normalize(m.group(1), _VALID_EMOTIONS_MAP, 'Neutral')
-                    if not self.color:
+                    if not self.color and 'color' in self.raw_text:
                         m = _RE_COLOR.search(self.raw_text)
                         if m:
                             self.color = _normalize(m.group(1), _VALID_COLORS_MAP, 'White')
+                    break
+
+                has_term = '.' in self.speech_buffer or '!' in self.speech_buffer or '?' in self.speech_buffer
+                has_clause = (',' in self.speech_buffer or ';' in self.speech_buffer or ':' in self.speech_buffer or
+                              '—' in self.speech_buffer or '–' in self.speech_buffer or '-' in self.speech_buffer)
+
+                if not (has_term or has_clause):
                     break
 
                 split_pos = None
@@ -436,13 +444,13 @@ class StreamingReplyParser:
                 if not self.first_chunk_sent:
                     # chunk 0: require enough speech buffer (>=3 words or >=14 chars) so audio duration
                     # (~1.5-2.0s) seamlessly hides synthesis of chunk 1, avoiding buffer starvation.
-                    term_match = _RE_TERMINAL_PUNCT.search(self.speech_buffer)
+                    term_match = _RE_TERMINAL_PUNCT.search(self.speech_buffer) if has_term else None
                     if term_match:
                         cand = self.speech_buffer[:term_match.start(1) + len(term_match.group(1).rstrip())].strip()
                         if _has_min_words(cand, MIN_FIRST_CHUNK_WORDS) or len(cand) >= MIN_FIRST_CHUNK_CHARS:
                             split_pos = term_match.end()
                             sentence = cand
-                    if split_pos is None:
+                    if split_pos is None and has_clause:
                         for cm in _RE_CLAUSE_PUNCT.finditer(self.speech_buffer):
                             punct = cm.group(1) or cm.group(2)
                             cand = self.speech_buffer[:cm.start() + len(punct)].strip()
@@ -452,12 +460,12 @@ class StreamingReplyParser:
                                 break
                 else:
                     # subsequent chunks: emit on terminal [.!?] or clause boundaries if >= 4 words
-                    term_match = _RE_TERMINAL_PUNCT.search(self.speech_buffer)
+                    term_match = _RE_TERMINAL_PUNCT.search(self.speech_buffer) if has_term else None
                     if term_match:
                         cand = self.speech_buffer[:term_match.start(1) + len(term_match.group(1).rstrip())].strip()
                         split_pos = term_match.end()
                         sentence = cand
-                    else:
+                    elif has_clause:
                         for cm in _RE_CLAUSE_PUNCT.finditer(self.speech_buffer):
                             punct = cm.group(1) or cm.group(2)
                             cand = self.speech_buffer[:cm.start() + len(punct)].strip()
