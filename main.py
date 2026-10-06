@@ -31,6 +31,7 @@ from openai_response import (
 )
 from peerbots_client import (
     asend_peerbots_message,
+    fire_peerbots_update,
     close_client as close_peerbots_client,
 )
 from kokoro_manager import (
@@ -145,10 +146,8 @@ async def send_greeting():
     try:
         if _USE_DROID and _PLAYBACK_QUEUE:
             # fire peerbots face silently and synthesize speech concurrently
-            asyncio.create_task(
-                asend_peerbots_message(
-                    GREETING_SPEECH, GREETING_EMOTION, GREETING_COLOR, silent=True
-                )
+            fire_peerbots_update(
+                GREETING_SPEECH, GREETING_EMOTION, GREETING_COLOR, silent=True
             )
             audio_bytes = await synthesize_speech(
                 GREETING_SPEECH, voice=KOKORO_VOICE, speed=KOKORO_SPEED
@@ -191,9 +190,7 @@ async def handle_turn(user_text, tools_list, tool_router):
     turn_start = time.time()
     if _USE_DROID:
         # speculative turn-start face update gives patient immediate responsive feedback
-        asyncio.create_task(
-            asend_peerbots_message('', 'Neutral', 'White', silent=True)
-        )
+        fire_peerbots_update('', 'Neutral', 'White', silent=True)
     if _USE_DROID and _PLAYBACK_QUEUE:
         _PLAYBACK_QUEUE.reset_turn()
 
@@ -225,9 +222,7 @@ async def handle_turn(user_text, tools_list, tool_router):
                 current_emotion = emotion
                 if _USE_DROID:
                     # silent update: sets face expression & halo glow with 0 volume
-                    asyncio.create_task(
-                        asend_peerbots_message('', emotion, color, silent=True)
-                    )
+                    fire_peerbots_update('', emotion, color, silent=True)
                 console.print(f'  [dim white]-> [face] {emotion} / {color}[/]')
 
             elif ev_type == 'sentence':
@@ -436,9 +431,7 @@ async def mic_loop(
                     pass
                 if _USE_DROID:
                     # set listening face state
-                    asyncio.create_task(
-                        asend_peerbots_message('', 'Neutral', 'White', silent=True)
-                    )
+                    fire_peerbots_update('', 'Neutral', 'White', silent=True)
                 console.print('\n[bold dark_orange][[LISTENING]][/]')
 
 
@@ -454,9 +447,7 @@ async def text_loop(tools_list, tool_router):
         if text:
             await handle_turn(text, tools_list, tool_router)
             if _USE_DROID:
-                asyncio.create_task(
-                    asend_peerbots_message('', 'Neutral', 'White', silent=True)
-                )
+                fire_peerbots_update('', 'Neutral', 'White', silent=True)
 
 
 async def amain(

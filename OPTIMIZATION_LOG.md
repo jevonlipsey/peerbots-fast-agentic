@@ -22,3 +22,9 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Change: Implemented `_VALID_EMOTIONS_MAP` and `_VALID_COLORS_MAP` in `peerbots_client.py` for O(1) face state normalization. Cached endpoint URL formatting in `_get_send_url(username)`. Replaced repeated in-loop imports of `numpy` and `torch` in `listen_audio_silero` with module-level lazy references `_get_stt_math()`.
 - Result: All tests passed, clean hot-path normalization and zero repeated import overhead in VAD loop.
 - TTFA_MS: ~894.14ms.
+
+## Iteration 4: Unified Fire-and-Forget Background Face Updates
+- Files: `main.py`
+- Change: Replaced uncoordinated `asyncio.create_task(asend_peerbots_message(..., silent=True))` background task invocations in `send_greeting`, `handle_turn` speculative start, `handle_turn` streaming face event, `mic_loop`, and `text_loop` with `fire_peerbots_update(...)`.
+- Result: All tests passed with zero exception leakage and clean non-blocking scheduling.
+- TTFA_MS: ~893.78ms.
