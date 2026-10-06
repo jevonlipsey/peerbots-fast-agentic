@@ -6,6 +6,7 @@ sends in-memory audio bytes to http://100.119.180.97:8765 over tailscale.
 import asyncio
 import io
 import os
+import struct
 import time
 import httpx
 import mutagen.mp3
@@ -54,24 +55,20 @@ def get_audio_duration_s(audio_bytes):
     if not audio_bytes:
         return 0.0
 
-    # fast path for wav
-    if audio_bytes.startswith(b'RIFF'):
+    # fast path for wav: direct struct header unpack without io.BytesIO or wave.open overhead
+    if audio_bytes.startswith(b'RIFF') and len(audio_bytes) >= 36:
         try:
-            import wave
-            with wave.open(io.BytesIO(audio_bytes), 'rb') as wf:
-                rate = wf.getframerate()
-                ch = wf.getnchannels()
-                width = wf.getsampwidth()
-                byte_rate = rate * ch * width
-                if byte_rate > 0:
-                    # streamed wavs (like kokoro-fastapi) set nframes to 2147483647
-                    data_pos = audio_bytes.find(b'data')
-                    header_offset = data_pos + 8 if data_pos != -1 else 44
-                    actual_data_len = max(0, len(audio_bytes) - header_offset)
-                    return max(0.1, actual_data_len / float(byte_rate))
+            ch, rate, byte_rate = struct.unpack_from('<HII', audio_bytes, 22)
+            if byte_rate > 0:
+                # streamed wavs (like kokoro-fastapi) set nframes to 2147483647
+                data_pos = audio_bytes.find(b'data')
+                header_offset = data_pos + 8 if data_pos != -1 else 44
+                actual_data_len = max(0, len(audio_bytes) - header_offset)
+                return max(0.1, actual_data_len / float(byte_rate))
         except Exception:
-            # fallback for 24khz 16-bit mono: 48000 bytes/sec
-            return max(0.1, (len(audio_bytes) - 44) / 48000.0)
+            pass
+        # fallback for 24khz 16-bit mono: 48000 bytes/sec
+        return max(0.1, (len(audio_bytes) - 44) / 48000.0)
 
     # mp3 path
     try:

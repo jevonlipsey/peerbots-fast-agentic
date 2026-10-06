@@ -13,6 +13,8 @@ import httpx
 
 ### magic constants & paths
 KOKORO_BASE_URL = os.environ.get('KOKORO_BASE_URL', 'http://localhost:8880')
+KOKORO_SPEECH_URL = f'{KOKORO_BASE_URL.rstrip("/")}/v1/audio/speech'
+KOKORO_DOCS_URL = f'{KOKORO_BASE_URL.rstrip("/")}/docs'
 KOKORO_DIR = os.path.expanduser(os.environ.get('KOKORO_DIR', '~/Kokoro-FastAPI'))
 DEFAULT_VOICE = 'af_heart:0.6+af_bella:0.4'
 DEFAULT_SPEED = 1.05
@@ -24,6 +26,7 @@ _KOKORO_PROC = None
 _STARTED_BY_US = False
 _ASYNC_CLIENT = None
 _TTS_CACHE = {}
+_VOICE_CACHE = {}
 
 
 def get_async_client():
@@ -58,6 +61,9 @@ def normalize_kokoro_voice(voice_str):
     """
     if not voice_str:
         return 'af_heart'
+    cached = _VOICE_CACHE.get(voice_str)
+    if cached is not None:
+        return cached
     chunks = voice_str.split('+')
     parts = []
     for chunk in chunks:
@@ -67,7 +73,9 @@ def normalize_kokoro_voice(voice_str):
             parts.append(f'{name.strip()}({weight.strip()})')
         else:
             parts.append(chunk)
-    return '+'.join(parts)
+    result = '+'.join(parts)
+    _VOICE_CACHE[voice_str] = result
+    return result
 
 
 ### lifecycle
@@ -80,10 +88,9 @@ def is_kokoro_running(timeout=0.6):
     outputs:
     running: boolean true if server responds with 200
     """
-    url = f'{KOKORO_BASE_URL.rstrip("/")}/docs'
     try:
         with httpx.Client(timeout=timeout) as client:
-            resp = client.get(url)
+            resp = client.get(KOKORO_DOCS_URL)
             return resp.status_code == 200
     except Exception:
         return False
@@ -98,7 +105,6 @@ async def ais_kokoro_running(timeout=0.6):
     outputs:
     running: boolean
     """
-    url = f'{KOKORO_BASE_URL.rstrip("/")}/docs'
     try:
         client = get_async_client()
         resp = await client.get(KOKORO_BASE_URL, timeout=timeout)
@@ -246,7 +252,6 @@ async def synthesize_speech(text, voice=DEFAULT_VOICE, speed=DEFAULT_SPEED, resp
     if cache_key in _TTS_CACHE:
         return _TTS_CACHE[cache_key]
 
-    url = f'{KOKORO_BASE_URL.rstrip("/")}/v1/audio/speech'
     payload = {
         'model': 'kokoro',
         'input': cleaned,
@@ -257,7 +262,7 @@ async def synthesize_speech(text, voice=DEFAULT_VOICE, speed=DEFAULT_SPEED, resp
 
     try:
         client = get_async_client()
-        resp = await client.post(url, json=payload)
+        resp = await client.post(KOKORO_SPEECH_URL, json=payload)
         if resp.status_code == 200:
             audio_bytes = resp.content
             if len(_TTS_CACHE) >= MAX_CACHE_ENTRIES:
