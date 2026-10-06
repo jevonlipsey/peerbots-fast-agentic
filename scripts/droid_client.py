@@ -264,7 +264,6 @@ class DroidPlaybackQueue:
                     await asyncio.sleep(wait_s)
             except asyncio.CancelledError:
                 self.is_playing = False
-                self.queue.task_done()
                 raise
             except Exception:
                 pass
