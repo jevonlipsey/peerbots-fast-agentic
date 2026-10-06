@@ -61,6 +61,9 @@ HALLUCINATIONS = [
     'thanks for watching', 'thank you for watching', 'subtitles by',
     'sh hotel', 'la latker',
 ]
+_HALLUCINATIONS_SET = {h.strip('.!?,') for h in HALLUCINATIONS} | {
+    'the', 'and', 'on', 'in', 'well', 'a', 'an', 'to'
+}
 
 
 ### util
@@ -71,13 +74,7 @@ def is_hallucination(text):
     normalized = text.lower().strip().strip('.!?,')
     if len(normalized) <= 1:
         return True
-    stripped = [h.strip('.!?,') for h in HALLUCINATIONS]
-    if normalized in stripped:
-        return True
-    # filter out single isolated filler words
-    if normalized in ('the', 'and', 'on', 'in', 'well', 'a', 'an', 'to'):
-        return True
-    return False
+    return normalized in _HALLUCINATIONS_SET
 
 
 def _filter_stderr(proc, ready_event):
@@ -243,7 +240,7 @@ def _ends_with_continuation(text):
     t = text.strip()
     if t.endswith(('...', '…', '—', '--', ',')):
         return True
-    words = t.split()
+    words = t.rsplit(maxsplit=1)
     if not words:
         return False
     last_word = words[-1].lower().strip('.,!?;:"\'-—–…')

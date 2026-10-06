@@ -53,4 +53,11 @@ Tracking autonomous iterative optimization for Lulo voice agent turn latency and
 - Result: All test harness and flow assertions passed. Clean execution with reduced CPU overhead per delta.
 - TTFA_MS: ~893.33ms.
 
+## Iteration 9: Tuple Cache Key & Greeting Pre-warm in Kokoro Manager
+- Files: `scripts/kokoro_manager.py`
+- Change: Replaced string-concatenated cache keys `f'{cleaned.lower()}|{norm_voice}|{speed}|{response_format}'` with 4-tuples `(cleaned.lower(), norm_voice, speed, response_format)` for zero-allocation hashing in C. Added `GREETING_SPEECH` ('Hey! How are you doing today?') to `PREWARM_PHRASES` so the initial greeting synthesizes at 0ms from in-memory cache upon session boot.
+- Result: All tests passed. Average TTFA dropped to 887.15ms.
+- TTFA_MS: ~887.15ms.
+
+
 
