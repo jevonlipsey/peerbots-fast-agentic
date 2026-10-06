@@ -388,7 +388,7 @@ class StreamingReplyParser:
     def feed(self, delta):
         self.raw_text += delta
         should_check_face = (not self.speech_started) or self.speech_finished
-        if should_check_face:
+        if should_check_face and (not self.emotion or not self.color):
             if not self.emotion:
                 m = _RE_EMOTION.search(self.raw_text)
                 if m:
@@ -414,7 +414,8 @@ class StreamingReplyParser:
                 if end_match:
                     self.speech_finished = True
                     part = self.speech_buffer[:end_match.start()].strip()
-                    part = part.replace('\\"', '"').replace('\\n', ' ')
+                    if '\\' in part:
+                        part = part.replace('\\"', '"').replace('\\n', ' ')
                     if part:
                         sentences.append(part)
                         self.first_chunk_sent = True
@@ -466,7 +467,8 @@ class StreamingReplyParser:
                                 break
 
                 if split_pos is not None and sentence:
-                    sentence = sentence.replace('\\"', '"').replace('\\n', ' ')
+                    if '\\' in sentence:
+                        sentence = sentence.replace('\\"', '"').replace('\\n', ' ')
                     self.speech_buffer = self.speech_buffer[split_pos:]
                     sentences.append(sentence)
                     self.first_chunk_sent = True
@@ -479,7 +481,8 @@ class StreamingReplyParser:
         if not self.speech_buffer:
             return []
         leftover = _RE_LEFTOVER_CLEANUP.sub('', self.speech_buffer).strip()
-        leftover = leftover.replace('\\"', '"').replace('\\n', ' ')
+        if '\\' in leftover:
+            leftover = leftover.replace('\\"', '"').replace('\\n', ' ')
         self.speech_buffer = ''
         if leftover and len(leftover) > 1:
             return [leftover]
