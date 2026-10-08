@@ -529,6 +529,61 @@ async def benchmark_naturalness_and_flow():
     assert abs(dur - 1.0) < 0.05, f'wav duration parse error: expected ~1.0s, got {dur}'
     print('  -> In-memory WAV byte duration parsing: PASS')
 
+    # 5. dual audio lip-sync mode
+    from main import PEERBOTS_DUAL_AUDIO
+    assert PEERBOTS_DUAL_AUDIO is True, 'dual audio should be enabled by default for tablet lip-sync'
+    print('  -> Dual audio tablet lip-sync enabled by default: PASS')
+
+    return True
+
+
+### benchmark 4: dialogue tree and extended pause assertions
+async def benchmark_dialogue_tree_and_pausing():
+    '''
+    validates dialogue tree prompt configuration and extended speech pausing.
+
+    inputs:
+    none
+    outputs:
+    boolean success
+    '''
+    print('\n--- 4. Dialogue Tree & Extended Pausing Assertions ---')
+    from main import PAUSE_THRESHOLD, GREETING_SPEECH
+    from scripts.whisper_stt import DEFAULT_VAD_SILENCE_S, _ends_with_continuation, listen_once
+    from scripts.openai_response import load_system_prompt
+    import inspect
+
+    # 1. pause threshold extended to 2.0s
+    assert PAUSE_THRESHOLD >= 2.0, f'pause threshold should be >= 2.0s, got {PAUSE_THRESHOLD}'
+    assert DEFAULT_VAD_SILENCE_S >= 2.0, f'vad silence should be >= 2.0s, got {DEFAULT_VAD_SILENCE_S}'
+    print(f'  -> Extended pause threshold ({PAUSE_THRESHOLD}s default): PASS')
+
+    # 2. listen_once signature accepts pause_threshold
+    sig = inspect.signature(listen_once)
+    assert 'pause_threshold' in sig.parameters, 'listen_once must accept pause_threshold'
+    print('  -> listen_once pause_threshold parameter pass-through: PASS')
+
+    # 3. extended continuation cues for dialogue tree reading
+    assert _ends_with_continuation('Yeah, how low should I...'), 'trailing ellipsis must trigger continuation'
+    assert _ends_with_continuation('take a break and'), 'trailing conjunction must trigger continuation'
+    assert _ends_with_continuation('wait'), 'hesitation word wait must trigger continuation'
+    assert _ends_with_continuation('well,'), 'trailing comma hesitation must trigger continuation'
+    assert not _ends_with_continuation('thanks lulo!'), 'completed exclamation must not trigger continuation'
+    print('  -> Dialogue reading continuation cues: PASS')
+
+    # 4. greeting matches study dialogue tree
+    assert GREETING_SPEECH == "Hi! I'm Lulo. Nice to meet you! What's your name?", f'unexpected greeting: {GREETING_SPEECH}'
+    print('  -> Startup greeting matches study dialogue tree: PASS')
+
+    # 5. system prompt contains dialogue tree nodes
+    prompt = load_system_prompt()
+    assert 'squats' in prompt.lower(), 'prompt must specify squats exercise'
+    assert 'curious deer' in prompt.lower(), 'prompt must contain deer backstory'
+    assert '90 degrees' in prompt.lower(), 'prompt must contain 90 degrees squat info'
+    assert 'throbbing' in prompt.lower(), 'prompt must contain throbbing knee escalation'
+    assert 'flag me when' in prompt.lower(), 'prompt must contain break recovery phrasing'
+    print('  -> System prompt study dialogue tree coverage: PASS')
+
     return True
 
 
@@ -543,6 +598,10 @@ def test_yap_and_flow_stress():
 
 def test_naturalness_and_flow():
     asyncio.run(benchmark_naturalness_and_flow())
+
+
+def test_dialogue_tree_and_pausing():
+    asyncio.run(benchmark_dialogue_tree_and_pausing())
 
 
 ### cli execution
@@ -564,6 +623,7 @@ async def amain():
     _, avg_ttfa = await benchmark_synthetic_latency({'scale': scale})
     await benchmark_yap_and_flow_stress()
     await benchmark_naturalness_and_flow()
+    await benchmark_dialogue_tree_and_pausing()
 
     print('\n======================================================================')
     print('ALL HARNESS ASSERTIONS PASSED (EXIT 0)')

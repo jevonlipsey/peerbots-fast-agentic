@@ -19,7 +19,7 @@ import speech_recognition as sr
 from dotenv import load_dotenv
 from rich.console import Console
 
-sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), 'scripts'))
+sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
 from whisper_stt import IS_MAC, listen_once, start_swift_worker, get_vad_model
 from openai_response import (
     connect_mcp,
@@ -57,22 +57,29 @@ console = Console()
 ### cli flags override these when present
 TEXT_MODE = False  # true = type instead of using the mic
 MIC_INDEX = 2  # microphone index, run with --list-mics to find yours
-PAUSE_THRESHOLD = 0.8  # seconds of silence before considering speech finished
+PAUSE_THRESHOLD = float(
+    os.environ.get("PAUSE_THRESHOLD", "2.0")
+)  # seconds of silence before considering speech finished
 USE_DROID_AUDIO = True  # send audio chunks to droid headless daemon
-KOKORO_VOICE = os.environ.get('KOKORO_VOICE', DEFAULT_VOICE)
-KOKORO_SPEED = float(os.environ.get('KOKORO_SPEED', str(DEFAULT_SPEED)))
+PEERBOTS_DUAL_AUDIO = os.environ.get("PEERBOTS_DUAL_AUDIO", "true").lower() in (
+    "true",
+    "1",
+    "yes",
+)
+KOKORO_VOICE = os.environ.get("KOKORO_VOICE", DEFAULT_VOICE)
+KOKORO_SPEED = float(os.environ.get("KOKORO_SPEED", str(DEFAULT_SPEED)))
 
 ### thinking mask, disabled by default to keep conversation snappy
 ENABLE_THINKING_FILLER = False
 THINK_DELAY_S = 2.0
-THINKING_SPEECH = 'Hmm, let me think about that...'
-THINKING_EMOTION = 'Neutral'
-THINKING_COLOR = 'Yellow'
+THINKING_SPEECH = "Hmm, let me think about that..."
+THINKING_EMOTION = "Neutral"
+THINKING_COLOR = "Yellow"
 
-### greeting spoken once at startup
-GREETING_SPEECH = "Hi! I'm Lulo, your physical therapy buddy! Are you ready to exercise with me?"
-GREETING_EMOTION = 'Happy'
-GREETING_COLOR = 'Green'
+### greeting spoken once at startup (matches hri dialogue tree)
+GREETING_SPEECH = "Hi! I'm Lulo. Nice to meet you! What's your name?"
+GREETING_EMOTION = "Happy"
+GREETING_COLOR = "Green"
 
 _CURRENT_SWIFT_PROC = None
 _PLAYBACK_QUEUE = None
@@ -80,17 +87,17 @@ _USE_DROID = False
 
 ### dynamic voice speed per emotion
 EMOTION_SPEED_MAP = {
-    'Happy': 1.12,
-    'Surprised': 1.10,
-    'Neutral': 1.05,
-    'Concerned': 0.92,
-    'Sad': 0.90,
-    'Sleepy': 0.88,
+    "Happy": 1.12,
+    "Surprised": 1.10,
+    "Neutral": 1.05,
+    "Concerned": 0.92,
+    "Sad": 0.90,
+    "Sleepy": 0.88,
 }
 
 
 def get_voice_speed_for_emotion(emotion, base_speed=KOKORO_SPEED):
-    '''
+    """
     scales playback speed based on lulo emotional state.
 
     inputs:
@@ -98,7 +105,7 @@ def get_voice_speed_for_emotion(emotion, base_speed=KOKORO_SPEED):
     base_speed: base float speed from config
     outputs:
     adjusted float speed
-    '''
+    """
     if not emotion:
         return base_speed
     mult = EMOTION_SPEED_MAP.get(emotion)
@@ -108,18 +115,18 @@ def get_voice_speed_for_emotion(emotion, base_speed=KOKORO_SPEED):
 
 
 def make_nod_callback(loop):
-    '''
+    """
     triggers silent face nod feedback during extended user monologues.
 
     inputs:
     loop: running asyncio event loop
     outputs:
     callable(seconds)
-    '''
+    """
     nod_faces = {
-        10: ('Happy', 'White'),
-        25: ('Neutral', 'White'),
-        45: ('Surprised', 'White'),
+        10: ("Happy", "White"),
+        25: ("Neutral", "White"),
+        45: ("Surprised", "White"),
     }
 
     def _on_nod(seconds):
@@ -130,10 +137,12 @@ def make_nod_callback(loop):
         try:
             loop.call_soon_threadsafe(
                 lambda: asyncio.create_task(
-                    asend_peerbots_message('', emotion, color, silent=True)
+                    asend_peerbots_message("", emotion, color, silent=True)
                 )
             )
-            console.print(f'  [dim cyan]-> [listening nod {seconds}s] {emotion} / {color}[/]')
+            console.print(
+                f"  [dim cyan]-> [listening nod {seconds}s] {emotion} / {color}[/]"
+            )
         except Exception:
             pass
 
@@ -145,16 +154,19 @@ async def send_greeting():
     global _USE_DROID, _PLAYBACK_QUEUE
     try:
         if _USE_DROID and _PLAYBACK_QUEUE:
-            # fire peerbots face silently and synthesize speech concurrently
+            # fire peerbots face/speech update and synthesize speech concurrently
             fire_peerbots_update(
-                GREETING_SPEECH, GREETING_EMOTION, GREETING_COLOR, silent=True
+                GREETING_SPEECH,
+                GREETING_EMOTION,
+                GREETING_COLOR,
+                silent=not PEERBOTS_DUAL_AUDIO,
             )
             audio_bytes = await synthesize_speech(
                 GREETING_SPEECH, voice=KOKORO_VOICE, speed=KOKORO_SPEED
             )
             if audio_bytes:
                 await _PLAYBACK_QUEUE.enqueue(audio_bytes, chunk_idx=0)
-                console.print(f'\n[bold green][[LULO]]:[/] {GREETING_SPEECH}')
+                console.print(f"\n[bold green][[LULO]]:[/] {GREETING_SPEECH}")
                 await _PLAYBACK_QUEUE.wait_complete()
                 return
 
@@ -162,9 +174,9 @@ async def send_greeting():
         await asend_peerbots_message(
             GREETING_SPEECH, GREETING_EMOTION, GREETING_COLOR, silent=False
         )
-        console.print(f'\n[bold green][[LULO]]:[/] {GREETING_SPEECH}')
+        console.print(f"\n[bold green][[LULO]]:[/] {GREETING_SPEECH}")
     except Exception as e:
-        console.print(f'[bold red][[ greeting failed: {e} ]][/]')
+        console.print(f"[bold red][[ greeting failed: {e} ]][/]")
 
 
 async def _delayed_think(delay):
@@ -173,13 +185,13 @@ async def _delayed_think(delay):
     try:
         await asend_peerbots_message(THINKING_SPEECH, THINKING_EMOTION, THINKING_COLOR)
     except Exception as e:
-        console.print(f'[dim yellow][[ thinking mask failed: {e} ]][/]')
+        console.print(f"[dim yellow][[ thinking mask failed: {e} ]][/]")
 
 
 async def handle_turn(user_text, tools_list, tool_router):
     # streaming turn: early emotion -> peerbots face, sentence -> kokoro -> droid queue
     global _USE_DROID, _PLAYBACK_QUEUE
-    console.print(f'\n[bold cyan][[USER]]:[/] {user_text}')
+    console.print(f"\n[bold cyan][[USER]]:[/] {user_text}")
 
     think_task = (
         asyncio.create_task(_delayed_think(THINK_DELAY_S))
@@ -188,14 +200,11 @@ async def handle_turn(user_text, tools_list, tool_router):
     )
 
     turn_start = time.time()
-    if _USE_DROID:
-        # speculative turn-start face update gives patient immediate responsive feedback
-        fire_peerbots_update('', 'Neutral', 'White', silent=True)
     if _USE_DROID and _PLAYBACK_QUEUE:
         _PLAYBACK_QUEUE.reset_turn()
 
     face_updated = False
-    current_emotion = 'Neutral'
+    current_emotion = "Neutral"
     tts_tasks = []
     spoken_sentences = []
     first_audio_sent = False
@@ -213,21 +222,21 @@ async def handle_turn(user_text, tools_list, tool_router):
             if think_task and not think_task.done():
                 think_task.cancel()
 
-            ev_type = event['type']
-            if ev_type == 'face' and not face_updated:
+            ev_type = event["type"]
+            if ev_type == "face" and not face_updated:
                 face_updated = True
                 # update peerbots face immediately without waiting for tts
-                emotion = event['emotion']
-                color = event['color']
+                emotion = event["emotion"]
+                color = event["color"]
                 current_emotion = emotion
-                if _USE_DROID:
-                    # silent update: sets face expression & halo glow with 0 volume
-                    fire_peerbots_update('', emotion, color, silent=True)
-                console.print(f'  [dim white]-> [face] {emotion} / {color}[/]')
+                if _USE_DROID and not PEERBOTS_DUAL_AUDIO:
+                    # silent update without speech if dual audio is off
+                    fire_peerbots_update("", emotion, color, silent=True)
+                console.print(f"  [dim white]-> [face] {emotion} / {color}[/]")
 
-            elif ev_type == 'sentence':
-                sent = event['text']
-                chunk_idx = event.get('idx', len(spoken_sentences))
+            elif ev_type == "sentence":
+                sent = event["text"]
+                chunk_idx = event.get("idx", len(spoken_sentences))
                 spoken_sentences.append(sent)
                 if chunk_idx == 0:
                     first_clause_time = time.time()
@@ -264,9 +273,20 @@ async def handle_turn(user_text, tools_list, tool_router):
                     task = asyncio.create_task(_synthesize_and_enqueue(sent, chunk_idx))
                     tts_tasks.append(task)
 
-            elif ev_type == 'final':
-                final_reply = event['reply']
-                metrics = event.get('metrics', {})
+            elif ev_type == "final":
+                final_reply = event["reply"]
+                metrics = event.get("metrics", {})
+                if _USE_DROID and PEERBOTS_DUAL_AUDIO:
+                    full_text = final_reply.get("speech", "") or " ".join(
+                        spoken_sentences
+                    )
+                    # send speech to peerbots to animate mouth; browser audio is muted on android
+                    fire_peerbots_update(
+                        full_text,
+                        final_reply.get("emotion", current_emotion),
+                        final_reply.get("color", "White"),
+                        silent=False,
+                    )
 
     finally:
         if think_task:
@@ -286,40 +306,40 @@ async def handle_turn(user_text, tools_list, tool_router):
         # fallback: tablet tts handles speech and face together
         try:
             await asend_peerbots_message(
-                final_reply['speech'],
-                final_reply['emotion'],
-                final_reply['color'],
+                final_reply["speech"],
+                final_reply["emotion"],
+                final_reply["color"],
                 silent=False,
             )
         except Exception as e:
-            console.print(f'[bold red][[ peerbots send failed: {e} ]][/]')
+            console.print(f"[bold red][[ peerbots send failed: {e} ]][/]")
 
     total_turn_s = time.time() - turn_start
     full_speech = (
-        ' '.join(spoken_sentences)
+        " ".join(spoken_sentences)
         if spoken_sentences
-        else (final_reply.get('speech', '') if final_reply else '')
+        else (final_reply.get("speech", "") if final_reply else "")
     )
-    console.print(f'\n[bold green][[LULO]]:[/] {full_speech}')
+    console.print(f"\n[bold green][[LULO]]:[/] {full_speech}")
 
-    emotion_disp = final_reply.get('emotion', 'Neutral') if final_reply else 'Neutral'
-    color_disp = final_reply.get('color', 'White') if final_reply else 'White'
+    emotion_disp = final_reply.get("emotion", "Neutral") if final_reply else "Neutral"
+    color_disp = final_reply.get("color", "White") if final_reply else "White"
 
     if first_audio_time:
         ttfa_s = first_audio_time - turn_start
-        ttft_ms = metrics.get('ttft_ms', 0)
+        ttft_ms = metrics.get("ttft_ms", 0)
         clause1_ms = (
             int((first_clause_time - turn_start) * 1000) if first_clause_time else 0
         )
-        face_ms = metrics.get('face_ms', 0)
+        face_ms = metrics.get("face_ms", 0)
         console.print(
-            f'  [bright_yellow]-> [Metrics] TTFA: {ttfa_s:.2f}s '
-            f'(TTFT: {ttft_ms}ms | Clause1: {clause1_ms}ms | TTS1: {tts1_ms}ms | Face: {face_ms}ms) '
-            f'| Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp}[/]'
+            f"  [bright_yellow]-> [Metrics] TTFA: {ttfa_s:.2f}s "
+            f"(TTFT: {ttft_ms}ms | Clause1: {clause1_ms}ms | TTS1: {tts1_ms}ms | Face: {face_ms}ms) "
+            f"| Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp}[/]"
         )
     else:
         console.print(
-            f'  [bright_yellow]-> [Metrics] Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp}[/]'
+            f"  [bright_yellow]-> [Metrics] Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp}[/]"
         )
 
 
@@ -375,13 +395,17 @@ async def mic_loop(
 
     recognizer = sr.Recognizer()
     recognizer.pause_threshold = pause_threshold
-    recognizer.non_speaking_duration = 0.15
+    recognizer.non_speaking_duration = 0.30
 
     vad_available = use_silero and (get_vad_model() is not None)
     if vad_available:
-        console.print("[dim white][[stt]]: neural silero-vad endpointing active (~150ms offset)[/]")
+        console.print(
+            f"[dim white][[stt]]: neural silero-vad endpointing active (pause_threshold={pause_threshold}s)[/]"
+        )
     else:
-        console.print(f"[dim white][[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]")
+        console.print(
+            f"[dim white][[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]"
+        )
 
     loop = asyncio.get_running_loop()
     nod_cb = make_nod_callback(loop) if _USE_DROID else None
@@ -408,6 +432,7 @@ async def mic_loop(
                 phrase_limit=90,
                 use_silero=vad_available,
                 nod_callback=nod_cb,
+                pause_threshold=pause_threshold,
             )
             if IS_MAC and swift_proc is not None and swift_proc.poll() is not None:
                 console.print("[dim white][[ reviving crashed stt worker... ]][/]")
@@ -423,31 +448,26 @@ async def mic_loop(
                 await handle_turn(text, tools_list, tool_router)
                 # discard buffered audio frames recorded during robot speaking to avoid echo loops
                 try:
-                    if hasattr(source, 'stream') and source.stream:
+                    if hasattr(source, "stream") and source.stream:
                         available = source.stream.get_read_available()
                         if available > 0:
                             source.stream.read(available, exception_on_overflow=False)
                 except Exception:
                     pass
-                if _USE_DROID:
-                    # set listening face state
-                    fire_peerbots_update('', 'Neutral', 'White', silent=True)
-                console.print('\n[bold dark_orange][[LISTENING]][/]')
+                console.print("\n[bold dark_orange][[LISTENING]][/]")
 
 
 async def text_loop(tools_list, tool_router):
     # typed fallback when there is no mic, or for quick lab testing
     await send_greeting()
-    console.print('\n[bold dark_orange][[TEXT MODE - type to lulo (quit to exit)]][/]')
+    console.print("\n[bold dark_orange][[TEXT MODE - type to lulo (quit to exit)]][/]")
     while True:
-        text = await asyncio.to_thread(input, 'you: ')
+        text = await asyncio.to_thread(input, "you: ")
         text = text.strip()
-        if text.lower() in ('quit', 'exit', 'q'):
+        if text.lower() in ("quit", "exit", "q"):
             break
         if text:
             await handle_turn(text, tools_list, tool_router)
-            if _USE_DROID:
-                fire_peerbots_update('', 'Neutral', 'White', silent=True)
 
 
 async def amain(
@@ -456,12 +476,14 @@ async def amain(
     pause_threshold=PAUSE_THRESHOLD,
     enable_droid=USE_DROID_AUDIO,
     use_silero=True,
+    enable_dual_audio=PEERBOTS_DUAL_AUDIO,
 ):
-    global _USE_DROID, _PLAYBACK_QUEUE
+    global _USE_DROID, _PLAYBACK_QUEUE, PEERBOTS_DUAL_AUDIO
+    PEERBOTS_DUAL_AUDIO = enable_dual_audio
     missing = [
         k
-        for k in ('OPENAI_API_KEY', 'PEERBOTS_API_KEY', 'PEERBOTS_USERNAME')
-        if not os.environ.get(k, '')
+        for k in ("OPENAI_API_KEY", "PEERBOTS_API_KEY", "PEERBOTS_USERNAME")
+        if not os.environ.get(k, "")
     ]
     if missing:
         console.print(f"[bold red][[ missing in .env: {', '.join(missing)} ]]")
@@ -469,31 +491,34 @@ async def amain(
 
     # initialize kokoro tts & droid audio if requested
     if enable_droid:
-        console.print('[dim white][[ checking kokoro tts & droid audio daemon... ]][/]')
+        console.print("[dim white][[ checking kokoro tts & droid audio daemon... ]][/]")
         koko_ok = await ensure_kokoro_ready()
         droid_ok = await ais_droid_reachable()
         if koko_ok and droid_ok:
             _USE_DROID = True
             _PLAYBACK_QUEUE = DroidPlaybackQueue()
             await _PLAYBACK_QUEUE.start()
+            mode_str = " + tablet lip-sync" if PEERBOTS_DUAL_AUDIO else " (silent face)"
             console.print(
-                '[bold green][[audio]]: streaming Kokoro MPS -> Droid daemon (100.119.180.97)[/]'
+                f"[bold green][[audio]]: streaming Kokoro MPS -> Droid daemon (100.119.180.97){mode_str}[/]"
             )
             try:
                 probe_res = await probe_droid_daemon()
-                probe_summary = ', '.join(
-                    f'{k}:{v}' for k, v in probe_res.items() if isinstance(v, int)
+                probe_summary = ", ".join(
+                    f"{k}:{v}" for k, v in probe_res.items() if isinstance(v, int)
                 )
                 if probe_summary:
-                    console.print(f'  [dim white]-> [droid endpoints] {probe_summary}[/]')
+                    console.print(
+                        f"  [dim white]-> [droid endpoints] {probe_summary}[/]"
+                    )
             except Exception:
                 pass
         else:
             reasons = []
             if not koko_ok:
-                reasons.append('kokoro offline')
+                reasons.append("kokoro offline")
             if not droid_ok:
-                reasons.append('droid unreachable')
+                reasons.append("droid unreachable")
             console.print(
                 f"[dim yellow][[audio fallback]]: {', '.join(reasons)}, using Peerbots tablet audio[/]"
             )
@@ -502,7 +527,7 @@ async def amain(
         _USE_DROID = False
 
     # prewarm openai connection pool and start keepalive
-    console.print('[dim white][[ pre-warming openai connection pool... ]][/]')
+    console.print("[dim white][[ pre-warming openai connection pool... ]][/]")
     await prewarm_openai()
     start_openai_keepalive()
 
@@ -537,43 +562,48 @@ async def amain(
 
 def main():
     global KOKORO_VOICE
-    parser = argparse.ArgumentParser(description='lulo peerbots companion')
+    parser = argparse.ArgumentParser(description="lulo peerbots companion")
     parser.add_argument(
-        '--text',
-        action='store_true',
+        "--text",
+        action="store_true",
         default=TEXT_MODE,
-        help='type instead of using the mic',
+        help="type instead of using the mic",
     )
     parser.add_argument(
-        '--mic-index',
+        "--mic-index",
         type=int,
         default=MIC_INDEX,
-        help='microphone index, see --list-mics',
+        help="microphone index, see --list-mics",
     )
     parser.add_argument(
-        '--pause-threshold',
+        "--pause-threshold",
         type=float,
         default=PAUSE_THRESHOLD,
-        help='seconds of silence before speech is considered done (default: 0.8)',
+        help="seconds of silence before speech is considered done (default: 2.0)",
     )
     parser.add_argument(
-        '--legacy-vad',
-        action='store_true',
-        help='disable silero-vad neural endpointing and use legacy energy-based threshold',
+        "--legacy-vad",
+        action="store_true",
+        help="disable silero-vad neural endpointing and use legacy energy-based threshold",
     )
     parser.add_argument(
-        '--no-droid',
-        action='store_true',
-        help='disable kokoro + droid audio and use peerbots tablet tts',
+        "--no-droid",
+        action="store_true",
+        help="disable kokoro + droid audio and use peerbots tablet tts",
     )
     parser.add_argument(
-        '--voice',
+        "--no-dual-audio",
+        action="store_true",
+        help="disable tablet lip-syncing speech and send silent face-only updates to peerbots",
+    )
+    parser.add_argument(
+        "--voice",
         type=str,
         default=KOKORO_VOICE,
-        help='kokoro voice or mixture (default: af_heart:0.6+af_bella:0.4)',
+        help="kokoro voice or mixture (default: af_heart:0.6+af_bella:0.4)",
     )
     parser.add_argument(
-        '--list-mics', action='store_true', help='print all microphones and exit'
+        "--list-mics", action="store_true", help="print all microphones and exit"
     )
     args = parser.parse_args()
     if args.list_mics:
@@ -593,6 +623,7 @@ def main():
                 pause_threshold=args.pause_threshold,
                 enable_droid=not args.no_droid,
                 use_silero=not args.legacy_vad,
+                enable_dual_audio=not args.no_dual_audio,
             )
         )
     except (KeyboardInterrupt, *_ExceptionGroupTypes):

@@ -28,7 +28,9 @@ def get_async_client():
     """cached persistent client for low-latency reusable http connections"""
     global _ASYNC_CLIENT
     if _ASYNC_CLIENT is None or _ASYNC_CLIENT.is_closed:
-        limits = httpx.Limits(max_keepalive_connections=10, max_connections=20, keepalive_expiry=60.0)
+        limits = httpx.Limits(
+            max_keepalive_connections=10, max_connections=20, keepalive_expiry=60.0
+        )
         _ASYNC_CLIENT = httpx.AsyncClient(timeout=DEFAULT_TIMEOUT_S, limits=limits)
     return _ASYNC_CLIENT
 
@@ -133,7 +135,7 @@ async def probe_droid_daemon():
     results = {}
     client = get_async_client()
     for ep in endpoints:
-        url = f'{DROID_URL.rstrip("/")}{ep}'
+        url = f"{DROID_URL.rstrip('/')}{ep}"
         try:
             r = await client.get(url, timeout=1.0)
             results[f'GET {ep}'] = r.status_code
@@ -192,12 +194,10 @@ class DroidPlaybackQueue:
         self.playback_end_time = 0.0
         self.last_upload_time = 0.12
 
-
     def ensure_worker(self):
         """ensures background worker is running without coroutine overhead"""
         if self.worker_task is None or self.worker_task.done():
             self.worker_task = asyncio.create_task(self._worker())
-
 
     def reset_turn(self):
         """resets expected chunk index and playback timing for a new conversational turn"""
@@ -205,11 +205,9 @@ class DroidPlaybackQueue:
         self.playback_end_time = 0.0
         self.ensure_worker()
 
-
     async def start(self):
         """starts background worker if not already running"""
         self.ensure_worker()
-
 
     async def stop(self):
         """cancels worker and flushes remaining queue items"""
@@ -230,7 +228,6 @@ class DroidPlaybackQueue:
         self.expected_idx = 0
         await close_client()
 
-
     async def enqueue(self, audio_bytes, duration_s=None, chunk_idx=None):
         """adds an audio chunk to the sequential playback stream"""
         if duration_s is None:
@@ -242,7 +239,6 @@ class DroidPlaybackQueue:
         self.ensure_worker()
         self.queue.put_nowait((audio_bytes, duration_s, chunk_idx))
 
-
     async def wait_complete(self):
         """waits until all queued audio chunks have been sent and played completely"""
         await self.queue.join()
@@ -253,7 +249,6 @@ class DroidPlaybackQueue:
         self.is_playing = False
         self.expected_idx = 0
         self.playback_end_time = 0.0
-
 
     async def _worker(self):
         """background loop sending chunks sequentially with duration pacing"""
@@ -269,7 +264,9 @@ class DroidPlaybackQueue:
 
                 if ok and duration_s > 0:
                     now = time.time()
-                    self.playback_end_time = max(now, self.playback_end_time) + duration_s
+                    self.playback_end_time = (
+                        max(now, self.playback_end_time) + duration_s
+                    )
                     # lead time accounts for tailscale upload round-trip for the NEXT chunk
                     lead_time = min(duration_s * 0.5, self.last_upload_time + 0.02)
                     target_wake = self.playback_end_time - lead_time

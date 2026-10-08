@@ -145,6 +145,7 @@ def start_kokoro_process():
 
 
 PREWARM_PHRASES = [
+    "Hi! I'm Lulo. Nice to meet you! What's your name?",
     'Hey! How are you doing today?',
     'hello there',
     'awesome,',

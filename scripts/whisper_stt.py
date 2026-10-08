@@ -39,6 +39,9 @@ TRANSCRIPTION_FILE = os.path.join(STATE_DIR, 'transcription.txt')
 ### daemon mode defaults to the system microphone
 MICROPHONE_INDEX = None
 
+DEFAULT_VAD_SILENCE_S = float(os.environ.get('VAD_SILENCE_DURATION_S', '2.0'))
+DEFAULT_NON_SPEAKING_S = float(os.environ.get('VAD_NON_SPEAKING_S', '0.30'))
+
 IS_MAC = platform.system() == 'Darwin'
 _SWIFT_TMP_WAV = os.path.join(tempfile.gettempdir(), f'lulo_stt_{os.getpid()}.wav')
 
@@ -231,6 +234,22 @@ CONTINUATION_CUES = {
     'if',
     'with',
     'when',
+    'well',
+    'wait',
+    'also',
+    'though',
+    'maybe',
+    'i',
+    "i'm",
+    'my',
+    'the',
+    'to',
+    'for',
+    'you',
+    'is',
+    'are',
+    'was',
+    'just',
 }
 
 
@@ -238,7 +257,7 @@ def _ends_with_continuation(text):
     if not text:
         return False
     t = text.strip()
-    if t.endswith(('...', '…', '—', '--', ',')):
+    if t.endswith(('...', '…', '—', '--', ',', '-', ':')):
         return True
     words = t.rsplit(maxsplit=1)
     if not words:
@@ -280,20 +299,20 @@ def listen_audio_silero(
     source,
     timeout=None,
     phrase_time_limit=90.0,
-    min_silence_duration_s=0.15,
-    non_speaking_duration_s=0.15,
+    min_silence_duration_s=DEFAULT_VAD_SILENCE_S,
+    non_speaking_duration_s=DEFAULT_NON_SPEAKING_S,
     speech_threshold=0.45,
     nod_callback=None,
 ):
     '''
-    captures one utterance using neural silero-vad for instant ~150ms speech-offset detection.
+    captures one utterance using neural silero-vad for forgiving endpointing.
 
     inputs:
     source: open speech_recognition audio source (e.g. Microphone)
     timeout: max seconds to wait for speech to start
     phrase_time_limit: max speech duration (default 90s)
-    min_silence_duration_s: silence duration to trigger endpoint (default 0.15s)
-    non_speaking_duration_s: pre/post padding silence duration (default 0.15s)
+    min_silence_duration_s: silence duration to trigger endpoint (default 2.0s)
+    non_speaking_duration_s: pre/post padding silence duration (default 0.30s)
     speech_threshold: vad speech probability threshold (default 0.45)
     nod_callback: callable(seconds) triggered at 10s, 25s, 45s of continuous speech
     outputs:
@@ -398,6 +417,7 @@ def listen_once(
     phrase_limit=90,
     use_silero=True,
     nod_callback=None,
+    pause_threshold=None,
 ):
     '''
     block for one complete utterance with adaptive continuation endpointing.
@@ -410,21 +430,24 @@ def listen_once(
     phrase_limit: max speech duration in seconds (default: 90)
     use_silero: whether to use neural silero vad (default: True)
     nod_callback: callable(seconds) for monologue nod feedback (10s, 25s, 45s)
+    pause_threshold: silence seconds before ending speech (default: 2.0s)
     outputs:
     transcribed string, '' if silence or junk
     '''
     vad_model = get_vad_model() if use_silero else None
+    silence_s = pause_threshold if pause_threshold is not None else DEFAULT_VAD_SILENCE_S
     try:
         if vad_model is not None:
             audio = listen_audio_silero(
                 source,
                 timeout=timeout,
                 phrase_time_limit=phrase_limit,
-                min_silence_duration_s=0.15,
-                non_speaking_duration_s=0.15,
+                min_silence_duration_s=silence_s,
+                non_speaking_duration_s=DEFAULT_NON_SPEAKING_S,
                 nod_callback=nod_callback,
             )
         else:
+            recognizer.pause_threshold = silence_s
             audio = recognizer.listen(source, timeout=timeout, phrase_time_limit=phrase_limit)
     except sr.WaitTimeoutError:
         return ''
@@ -437,20 +460,21 @@ def listen_once(
         return ''
     text = text.strip()
 
-    # adaptive endpointing: if user paused on a continuation cue, give a quick bonus window
+    # adaptive endpointing: if user paused on a continuation cue, give a bonus window
     extensions = 0
+    continuation_silence_s = max(1.2, silence_s * 0.75)
     while text and _ends_with_continuation(text) and extensions < 3:
         try:
             if vad_model is not None:
                 extra_audio = listen_audio_silero(
                     source,
-                    timeout=1.2,
+                    timeout=1.5,
                     phrase_time_limit=20,
-                    min_silence_duration_s=0.20,
+                    min_silence_duration_s=continuation_silence_s,
                     nod_callback=nod_callback,
                 )
             else:
-                extra_audio = recognizer.listen(source, timeout=1.2, phrase_time_limit=20)
+                extra_audio = recognizer.listen(source, timeout=1.5, phrase_time_limit=20)
             extra_text, _ = transcribe_audio(recognizer, extra_audio, swift_proc)
             if extra_text and not is_hallucination(extra_text):
                 text = f'{text} {extra_text.strip()}'.strip()
@@ -475,8 +499,8 @@ def main():
         console.print('[dim white][[STT_WORKER]]: python whisper fallback ready[/]')
 
     r = sr.Recognizer()
-    r.pause_threshold = 0.8
-    r.non_speaking_duration = 0.3
+    r.pause_threshold = DEFAULT_VAD_SILENCE_S
+    r.non_speaking_duration = DEFAULT_NON_SPEAKING_S
 
     with sr.Microphone(device_index=MICROPHONE_INDEX) as source:
         if getattr(source, 'stream', None) is None:
