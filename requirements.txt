@@ -14,3 +14,8 @@ PyAudio>=0.2.14
 # Neural VAD for sub-second speech endpointing
 silero-vad>=6.0.0
 onnxruntime>=1.16.0
+
+httpx
+mutagen
+aiohttp
+

@@ -9,6 +9,7 @@ blocks for the length of the clip, which gives us the pacing for free.
 import asyncio
 import os
 import shutil
+import sys
 import tempfile
 
 from rich.console import Console
@@ -17,9 +18,11 @@ from kokoro_manager import AUDIO_FORMAT
 
 console = Console()
 
-# swap this out if you play through something other than afplay (sox, ffplay...).
-# a command that takes a file path as its last argument.
-LOCAL_PLAY_CMD = os.environ.get('LOCAL_PLAY_CMD', 'afplay')
+# a command that takes a file path as its last argument and blocks until the clip
+# finishes. afplay is mac only; aplay is the alsa equivalent on linux. override
+# with LOCAL_PLAY_CMD for anything else (ffplay, paplay, sox...).
+_DEFAULT_PLAY_CMD = 'afplay' if sys.platform == 'darwin' else 'aplay'
+LOCAL_PLAY_CMD = os.environ.get('LOCAL_PLAY_CMD', _DEFAULT_PLAY_CMD)
 
 
 class LocalPlaybackQueue:

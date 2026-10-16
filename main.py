@@ -347,10 +347,82 @@ async def handle_turn(user_text, tools_list, tool_router):
 
 
 def list_mics():
-    # print every input device so the user can pick --mic-index
-    microphones = sr.Microphone.list_microphone_names()
-    for index, name in enumerate(microphones):
-        print(f'Microphone with index {index} and name "{name}" found')
+    '''
+    list every audio device with its input channel count.
+
+    pyaudio enumerates all alsa devices, including the many pseudo devices that
+    have no capture channels at all. without the channel count an output-only
+    device looks like a perfectly good microphone, and picking it fails with an
+    opaque 'channelCount <= maxChans' error deep in alsa.
+    '''
+    try:
+        import pyaudio
+    except Exception as exc:
+        console.print(f'[bold red][[ could not enumerate audio devices: {exc} ]][/]')
+        return
+    pa = pyaudio.PyAudio()
+    try:
+        try:
+            default_index = pa.get_default_input_device_info()['index']
+        except Exception:
+            default_index = None
+        for index in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(index)
+            channels = int(info.get('maxInputChannels', 0))
+            name = info.get('name', 'unknown')
+            if channels > 0:
+                mark = '->' if index == default_index else '  '
+                line = f'{mark} [{index}] {name} ({channels} input channels)'
+            else:
+                line = f'   [{index}] {name} (output only)'
+            # markup off, the bracketed index otherwise parses as a rich tag
+            console.print(line, style=None if channels > 0 else 'dim', markup=False)
+        console.print('  -> = system default. choose one with: python main.py --mic-index N', style='dim')
+    finally:
+        pa.terminate()
+
+
+def _probe_mic(mic_index):
+    '''
+    open a throwaway 16k mono input stream to confirm the device can capture.
+
+    speech_recognition's Microphone.__enter__ swallows the open error and leaves
+    stream None, then __exit__ calls self.stream.close() with no None guard. the
+    real error is therefore buried under a bogus 'NoneType has no attribute
+    close'. checking here instead lets us report what actually went wrong.
+
+    inputs:
+    mic_index: pyaudio device index, or None for the system default
+    outputs:
+    ok: True when a stream opened
+    detail: error text when ok is False, otherwise None
+    '''
+    try:
+        import pyaudio
+    except Exception as exc:
+        return False, f'pyaudio unavailable ({exc})'
+    pa = pyaudio.PyAudio()
+    stream = None
+    try:
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=1,
+            rate=16000,
+            input=True,
+            input_device_index=mic_index,
+            frames_per_buffer=1024,
+        )
+        return True, None
+    except Exception as exc:
+        return False, str(exc)
+    finally:
+        if stream is not None:
+            try:
+                stream.stop_stream()
+                stream.close()
+            except Exception:
+                pass
+        pa.terminate()
 
 
 try:
@@ -413,12 +485,17 @@ async def mic_loop(
     loop = asyncio.get_running_loop()
     nod_cb = make_nod_callback(loop) if _USE_DROID else None
 
+    # probe before entering the context manager. a failed open leaves stream as
+    # None and speech_recognition's __exit__ then raises AttributeError on top of
+    # the real error, so the failure has to be caught out here instead
+    ok, detail = _probe_mic(mic_index)
+    if not ok:
+        console.print(f"[bold red][[ fatal: could not open microphone: {detail} ]][/]")
+        console.print("[dim white][[ audio devices on this machine ]][/]")
+        list_mics()
+        sys.exit(1)
+
     with sr.Microphone(device_index=mic_index, sample_rate=16000) as source:
-        if getattr(source, "stream", None) is None:
-            console.print(
-                "[bold red][[ fatal: could not open microphone, run --list-mics to find yours ]]"
-            )
-            sys.exit(1)
         console.print("[dim white][[ calibrating for room noise... ]][/]")
         recognizer.adjust_for_ambient_noise(source, duration=1.5)
         await send_greeting()
