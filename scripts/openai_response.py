@@ -252,11 +252,17 @@ async def connect_mcp(stack):
         return [], {}
     try:
         tools, router = await load_and_register_mcp_servers(stack, MCP_CONFIG_PATH)
-        console.print('[dim white][[ SYSTEM: MCP tools ready. ]][/]')
-        return tools, router
     except Exception as e:
         console.print(f'[dim yellow][[ mcp boot failed, continuing without tools: {e} ]][/]')
         return [], {}
+    if tools:
+        console.print(f'[dim white][[ SYSTEM: {len(tools)} MCP tool(s) ready. ]][/]')
+    else:
+        console.print(
+            '[dim yellow][[ no MCP tools loaded (uvx / mcp-server-* not installed?), '
+            'continuing without tools ]][/]'
+        )
+    return tools, router
 
 
 def _parse_args(raw):

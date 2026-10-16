@@ -228,6 +228,65 @@ page.
 
 ---
 
+## stage 4 — physical actuator body (optional)
+
+Lulo can move a linear actuator over usb serial: his body extends and retracts to
+match his emotion (Happy bounces, Surprised startles, Sad slumps, Concerned nods,
+...), and the OpenAI agent can also call actuator tools on purpose.
+
+### 4.1 install arduino-cli
+
+```bash
+# linux / macos, no sudo, installs into ~/.local/bin
+curl -fsSL https://raw.githubusercontent.com/arduino/arduino-cli/master/install.sh | BINDIR=$HOME/.local/bin sh
+export PATH="$HOME/.local/bin:$PATH"   # add this to your shell rc to keep it
+```
+
+### 4.2 install the board core
+
+```bash
+arduino-cli core update-index
+arduino-cli core install arduino:avr   # uno / nano / mega
+```
+
+### 4.3 flash the firmware
+
+wire the L298N as noted at the top of the sketch (ENA->D5, IN1->D10, IN2->D8,
+button D2->GND, shared GND), plug the board in over usb, then:
+
+```bash
+arduino-cli board list                          # find the port, e.g. /dev/ttyACM0
+arduino-cli compile --fqbn arduino:avr:uno arduino/lulo_arm
+arduino-cli upload  --fqbn arduino:avr:uno -p /dev/ttyACM0 arduino/lulo_arm
+```
+
+adjust `--fqbn` (`arduino:avr:nano`, `arduino:avr:mega`) and `-p` to your board.
+`arduino/actuator_button.ino` is the standalone button-only sketch if you just
+want to test the mechanics by hand.
+
+### 4.4 run it
+
+```bash
+python main.py                  # auto-detects the board
+python main.py --arm-port /dev/ttyACM0
+python main.py --list-arm-ports
+python main.py --no-arduino     # disable the body entirely
+```
+
+on startup you will see `[[arm]]: lulo body online on <port>`, or, when no board
+is connected, `simulation mode` where commands are logged but not sent. the rest
+of the pipeline works either way, so you can develop without hardware.
+
+notes
+
+- there is no position sensor: the firmware integrates position from drive time,
+  assumes fully retracted at power-up, and re-syncs at each end.
+- the manual button still works and overrides any gesture.
+- env: `ARDUINO_PORT`, `ARDUINO_BAUD` (default 115200), `LULO_ARM_PORT` (the
+  localhost control socket the agent's tools talk to, default 5007).
+
+---
+
 ## do not run these
 
 `setup/setup.sh` and `setup/setup.bat` are leftovers from the earlier nao
@@ -266,6 +325,9 @@ python main.py --mic-index <the pulse device index>
 | phone page loads but never hears you | it must be `localhost` or `https`, and you must tap **Enable microphone** |
 | `[[ phone-mic ]]: another browser already streaming` | close the extra tabs — only one phone may stream at a time |
 | lulo cuts you off mid-sentence | `python main.py --pause-threshold 3.0` |
+| `[[arm]]: ... simulation mode` | no board detected. check usb, run `python main.py --list-arm-ports`, or set `ARDUINO_PORT` |
+| the body moves the wrong way | swap the L298N motor leads (or swap IN1/IN2) |
+| `permission denied` opening the board | add yourself to `dialout`: `sudo usermod -aG dialout $USER`, then log out and back in |
 
 ## never commit
 

@@ -1,5 +1,13 @@
 {
   "mcpServers": {
+    "lulo_actuator": {
+      "command": "{python}",
+      "args": ["./mcp-servers/lulo_actuator/server.py"],
+      "env": {
+        "LULO_ARM_HOST": "127.0.0.1",
+        "LULO_ARM_PORT": "5007"
+      }
+    },
     "time": {
       "command": "uvx",
       "args": ["-q", "mcp-server-time"]

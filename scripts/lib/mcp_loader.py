@@ -6,14 +6,22 @@ registry plus a name -> session router. generic servers only
 
 import json
 import os
+import sys
 from contextlib import AsyncExitStack
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from rich.console import Console
+
+console = Console()
 
 
 def _resolve(val, base_dir):
-    # './x' paths are relative to the config file, everything else passes through
+    # '{python}' expands to the interpreter running main.py so mcp servers share
+    # the project venv (uvx is not always installed). './x' paths are relative to
+    # the config file, everything else passes through
+    if isinstance(val, str) and '{python}' in val:
+        val = val.replace('{python}', sys.executable)
     if isinstance(val, str) and val.startswith('./'):
         return os.path.abspath(os.path.join(base_dir, val[2:]))
     return val
@@ -38,22 +46,29 @@ async def load_and_register_mcp_servers(stack: AsyncExitStack, config_path: str)
 
     devnull = open(os.devnull, 'w')
     for server_name, server_config in config.get('mcpServers', {}).items():
-        command = server_config['command']
-        args = [_resolve(a, base_dir) for a in server_config.get('args', [])]
-        env = dict(os.environ)
-        for key, val in server_config.get('env', {}).items():
-            env[key] = _resolve(val, base_dir)
-        params = StdioServerParameters(command=command, args=args, env=env)
+        try:
+            command = _resolve(server_config['command'], base_dir)
+            args = [_resolve(a, base_dir) for a in server_config.get('args', [])]
+            env = dict(os.environ)
+            for key, val in server_config.get('env', {}).items():
+                env[key] = _resolve(val, base_dir)
+            params = StdioServerParameters(command=command, args=args, env=env)
 
-        transport = await stack.enter_async_context(
-            stdio_client(params, errlog=devnull)
-        )
-        session = await stack.enter_async_context(
-            ClientSession(transport[0], transport[1])
-        )
-        await session.initialize()
+            transport = await stack.enter_async_context(
+                stdio_client(params, errlog=devnull)
+            )
+            session = await stack.enter_async_context(
+                ClientSession(transport[0], transport[1])
+            )
+            await session.initialize()
 
-        result = await session.list_tools()
+            result = await session.list_tools()
+        except Exception as e:
+            # one server that cannot start (missing binary, e.g. uvx) must not
+            # take down the servers that can. skip it and keep going.
+            console.print(f'[dim yellow][[ mcp: skipped "{server_name}": {e} ]][/]')
+            continue
+
         for tool in result.tools:
             # mcp 1.x calls it inputSchema, 2.x renamed it input_schema
             schema = getattr(tool, 'input_schema', None) or getattr(

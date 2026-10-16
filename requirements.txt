@@ -19,3 +19,6 @@ httpx
 mutagen
 aiohttp
 
+# USB serial control of lulo's linear-actuator body (arduino)
+pyserial>=3.5
+
