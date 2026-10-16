@@ -3,6 +3,10 @@
 # ========================================
 .env
 
+# Secrets / credentials
+.peerbots_token
+*.pem
+
 # Runtime State / IPC
 state/*.txt
 state/*.jpg

@@ -367,6 +367,13 @@ def listen_audio_silero(
 
             prob = vad_model(audio_float, 16000).item()
 
+            # speech onset is otherwise invisible, which makes a stalled vad
+            # indistinguishable from a dead microphone
+            if not speaking_started and prob >= speech_threshold:
+                console.print(
+                    f'[bold dark_orange][[VAD]] speech detected (p={prob:.2f})[/]'
+                )
+
             if not speaking_started:
                 if timeout is not None and (time.time() - start_time) > timeout:
                     raise sr.WaitTimeoutError('listening timed out waiting for speech')
@@ -453,6 +460,11 @@ def listen_once(
         return ''
     except Exception as e:
         console.print(f'[bold red][[ capture error: {e} ]][/]')
+        return ''
+
+    if not audio.get_raw_data():
+        # no speech made it through the vad, so there is nothing to transcribe
+        # and the coreml worker rejects empty audio with invalidAudioData
         return ''
 
     text, _ = transcribe_audio(recognizer, audio, swift_proc)

@@ -21,6 +21,7 @@ from rich.console import Console
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
 from whisper_stt import IS_MAC, listen_once, start_swift_worker, get_vad_model
+from phone_mic_server import PhoneMicServer
 from openai_response import (
     connect_mcp,
     stream_peerbots_reply,
@@ -49,6 +50,8 @@ from droid_client import (
     probe_droid_daemon,
     close_client as close_droid_client,
 )
+from local_playback import LocalPlaybackQueue
+from phone_playback import PhoneSpeakerQueue
 
 load_dotenv()
 console = Console()
@@ -457,6 +460,106 @@ async def mic_loop(
                 console.print("\n[bold dark_orange][[LISTENING]][/]")
 
 
+async def phone_mic_loop(
+    tools_list,
+    tool_router,
+    port=8443,
+    token="",
+    use_tunnel=False,
+    pause_threshold=PAUSE_THRESHOLD,
+    use_silero=True,
+    phone_audio=False,
+):
+    # stream audio from phone browser over websocket
+    global _CURRENT_SWIFT_PROC, _PLAYBACK_QUEUE
+    swift_proc = None
+    if IS_MAC:
+        try:
+            swift_proc = start_swift_worker()
+            _CURRENT_SWIFT_PROC = swift_proc
+        except Exception as e:
+            console.print(
+                f"[dim yellow][[ coreml worker failed, whisper fallback: {e} ]]"
+            )
+    if swift_proc is None:
+        console.print("[dim white][[stt]]: python whisper fallback ready[/]")
+
+    server = PhoneMicServer(port=port, token=token, use_tunnel=use_tunnel)
+    await server.start()
+
+    if phone_audio:
+        # tts rides back down the mic socket and plays on the handset speaker
+        _PLAYBACK_QUEUE = PhoneSpeakerQueue(server)
+        await _PLAYBACK_QUEUE.start()
+
+    recognizer = sr.Recognizer()
+    recognizer.pause_threshold = pause_threshold
+    recognizer.non_speaking_duration = 0.30
+
+    vad_available = use_silero and (get_vad_model() is not None)
+    if vad_available:
+        console.print(
+            f"[dim white][[stt]]: neural silero-vad endpointing active (pause_threshold={pause_threshold}s)[/]"
+        )
+    else:
+        console.print(
+            f"[dim white][[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]"
+        )
+
+    loop = asyncio.get_running_loop()
+    nod_cb = make_nod_callback(loop) if _USE_DROID else None
+
+    source = server.get_source()
+    if phone_audio:
+        # speech comes out of the handset, so there is no point greeting an empty room
+        console.print(
+            "[dim white][[ waiting for the phone browser to open the page... ]][/]"
+        )
+        await server.wait_for_client(timeout=180)
+    await send_greeting()
+    # the phone starts streaming the moment it connects, so anything said during
+    # the greeting sits in the queue and gets transcribed as if the robot asked it
+    server._drain_queue()
+    console.print(
+        "\n[bold dark_orange][[PHONE MIC READY - open face URL and speak (ctrl-c to quit)]][/]"
+    )
+
+    try:
+        while True:
+            text = await asyncio.to_thread(
+                listen_once,
+                recognizer,
+                source,
+                swift_proc,
+                timeout=None,
+                phrase_limit=90,
+                use_silero=vad_available,
+                nod_callback=nod_cb,
+                pause_threshold=pause_threshold,
+            )
+            if IS_MAC and swift_proc is not None and swift_proc.poll() is not None:
+                console.print("[dim white][[ reviving crashed stt worker... ]][/]")
+                try:
+                    swift_proc = start_swift_worker()
+                    _CURRENT_SWIFT_PROC = swift_proc
+                except Exception as e:
+                    console.print(
+                        f"[dim yellow][[ stt worker failed, whisper fallback: {e} ]]"
+                    )
+                    swift_proc = None
+            if text:
+                await handle_turn(text, tools_list, tool_router)
+                # clear audio queue of any audio recorded during robot speech
+                while not server.audio_queue.empty():
+                    try:
+                        server.audio_queue.get_nowait()
+                    except Exception:
+                        break
+                console.print("\n[bold dark_orange][[LISTENING (PHONE MIC)]][/]")
+    finally:
+        await server.stop()
+
+
 async def text_loop(tools_list, tool_router):
     # typed fallback when there is no mic, or for quick lab testing
     await send_greeting()
@@ -477,6 +580,12 @@ async def amain(
     enable_droid=USE_DROID_AUDIO,
     use_silero=True,
     enable_dual_audio=PEERBOTS_DUAL_AUDIO,
+    use_phone_mic=False,
+    phone_mic_port=8443,
+    phone_mic_token="",
+    use_tunnel=False,
+    local_audio=False,
+    phone_audio=False,
 ):
     global _USE_DROID, _PLAYBACK_QUEUE, PEERBOTS_DUAL_AUDIO
     PEERBOTS_DUAL_AUDIO = enable_dual_audio
@@ -489,16 +598,39 @@ async def amain(
         console.print(f"[bold red][[ missing in .env: {', '.join(missing)} ]]")
         sys.exit(1)
 
-    # initialize kokoro tts & droid audio if requested
+    # initialize kokoro tts & the audio sink if requested
+    audio_sink = 'tablet'
     if enable_droid:
         console.print("[dim white][[ checking kokoro tts & droid audio daemon... ]][/]")
         koko_ok = await ensure_kokoro_ready()
-        droid_ok = await ais_droid_reachable()
-        if koko_ok and droid_ok:
-            _USE_DROID = True
+        if koko_ok:
+            if phone_audio:
+                if not use_phone_mic:
+                    console.print("[bold red][[ --phone-audio needs --phone-mic ]][/]")
+                else:
+                    audio_sink = 'phone'
+            elif local_audio:
+                audio_sink = 'mac'
+            elif await ais_droid_reachable():
+                audio_sink = 'droid'
+
+    if audio_sink == 'tablet':
+        if enable_droid:
+            reasons = []
+            if not koko_ok:
+                reasons.append("kokoro offline")
+            elif not (phone_audio or local_audio):
+                reasons.append("droid unreachable")
+            console.print(
+                f"[dim yellow][[ audio fallback ]]: {', '.join(reasons) or 'no sink available'}, using Peerbots tablet audio[/]"
+            )
+        _USE_DROID = False
+    else:
+        _USE_DROID = True
+        mode_str = " + tablet lip-sync" if PEERBOTS_DUAL_AUDIO else " (silent face)"
+        if audio_sink == 'droid':
             _PLAYBACK_QUEUE = DroidPlaybackQueue()
             await _PLAYBACK_QUEUE.start()
-            mode_str = " + tablet lip-sync" if PEERBOTS_DUAL_AUDIO else " (silent face)"
             console.print(
                 f"[bold green][[audio]]: streaming Kokoro MPS -> Droid daemon (100.119.180.97){mode_str}[/]"
             )
@@ -513,18 +645,17 @@ async def amain(
                     )
             except Exception:
                 pass
-        else:
-            reasons = []
-            if not koko_ok:
-                reasons.append("kokoro offline")
-            if not droid_ok:
-                reasons.append("droid unreachable")
+        elif audio_sink == 'mac':
+            _PLAYBACK_QUEUE = LocalPlaybackQueue()
+            await _PLAYBACK_QUEUE.start()
             console.print(
-                f"[dim yellow][[audio fallback]]: {', '.join(reasons)}, using Peerbots tablet audio[/]"
+                f"[bold green][[audio]]: streaming Kokoro MPS -> local speakers{mode_str}[/]"
             )
-            _USE_DROID = False
-    else:
-        _USE_DROID = False
+        else:
+            # the queue is built in phone_mic_loop once the server exists
+            console.print(
+                f"[bold green][[audio]]: streaming Kokoro MPS -> phone browser speakers{mode_str}[/]"
+            )
 
     # prewarm openai connection pool and start keepalive
     console.print("[dim white][[ pre-warming openai connection pool... ]][/]")
@@ -539,6 +670,17 @@ async def amain(
             tools_list, tool_router = await connect_mcp(stack)
             if use_text:
                 await text_loop(tools_list, tool_router)
+            elif use_phone_mic:
+                await phone_mic_loop(
+                    tools_list,
+                    tool_router,
+                    port=phone_mic_port,
+                    token=phone_mic_token,
+                    use_tunnel=use_tunnel,
+                    pause_threshold=pause_threshold,
+                    use_silero=use_silero,
+                    phone_audio=phone_audio,
+                )
             else:
                 await mic_loop(
                     mic_index,
@@ -592,9 +734,41 @@ def main():
         help="disable kokoro + droid audio and use peerbots tablet tts",
     )
     parser.add_argument(
+        "--local-audio",
+        action="store_true",
+        help="play kokoro tts through this machine's speakers instead of the droid daemon",
+    )
+    parser.add_argument(
+        "--phone-audio",
+        action="store_true",
+        help="stream kokoro tts to the phone browser and play it on the handset speaker (needs --phone-mic)",
+    )
+    parser.add_argument(
         "--no-dual-audio",
         action="store_true",
         help="disable tablet lip-syncing speech and send silent face-only updates to peerbots",
+    )
+    parser.add_argument(
+        "--phone-mic",
+        action="store_true",
+        help="stream audio from phone browser microphone over websocket",
+    )
+    parser.add_argument(
+        "--phone-port",
+        type=int,
+        default=int(os.environ.get("PHONE_MIC_PORT", "8443")),
+        help="port for phone microphone server (default: 8443)",
+    )
+    parser.add_argument(
+        "--phone-token",
+        type=str,
+        default=os.environ.get("PEERBOTS_TOKEN", ""),
+        help="optional token query parameter for phone mic access",
+    )
+    parser.add_argument(
+        "--phone-tunnel",
+        action="store_true",
+        help="automatically launch a public Cloudflare HTTPS tunnel for phone mic (no USB needed)",
     )
     parser.add_argument(
         "--voice",
@@ -624,6 +798,12 @@ def main():
                 enable_droid=not args.no_droid,
                 use_silero=not args.legacy_vad,
                 enable_dual_audio=not args.no_dual_audio,
+                use_phone_mic=args.phone_mic,
+                phone_mic_port=args.phone_port,
+                phone_mic_token=args.phone_token,
+                use_tunnel=args.phone_tunnel,
+                local_audio=args.local_audio,
+                phone_audio=args.phone_audio,
             )
         )
     except (KeyboardInterrupt, *_ExceptionGroupTypes):
