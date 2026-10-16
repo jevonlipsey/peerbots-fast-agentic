@@ -109,7 +109,11 @@ function playNextClip(){
 startBtn.onclick=async()=>{
   startBtn.disabled=true;
   try{
-    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true},video:false});
+    // these default to chrome's phone-call tuning, which assumes a mouth 2cm away.
+    // at arm's length the noise gate cuts word onsets down to digital silence and
+    // the auto gain pumps the room noise floor up until the vad fires on it, so ask
+    // for the raw signal and let whisper handle level.
+    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});
   }catch(err){
     setStatus('Mic blocked ('+err.name+') — allow mic in browser settings');
     startBtn.disabled=false;

@@ -1,6 +1,7 @@
 import asyncio
 import os
 import ssl
+import time
 from pathlib import Path
 from queue import Empty, Queue
 
@@ -21,6 +22,12 @@ HTML_FILE = PHONE_MIC_DIR / 'face.html'
 # how long the phone can send nothing before we give up on the current utterance.
 # a browser reconnect takes ~1.5s, so this is generous slack rather than a sniff.
 PHONE_MIC_IDLE_BAIL = 20.0
+
+# the page ships a chunk roughly every 85ms (4096 samples at the audio context
+# rate). anything much longer than that is the link stalling, not the speaker
+# going quiet, and it is the difference between "walked out of wifi range" and
+# "the microphone is bad".
+FRAME_GAP_WARN_S = 0.25
 
 
 class PhoneMicStream:
@@ -107,6 +114,8 @@ class PhoneMicServer:
         self.audio_queue = Queue(maxsize=50)
         self._rms_sum = 0.0
         self._rms_frames = 0
+        self._last_frame_time = None
+        self._frame_gaps = 0
         self.app = web.Application()
         self.app.router.add_get('/', self._handle_index)
         self.app.router.add_get('/audio', self._handle_audio)
@@ -149,6 +158,8 @@ class PhoneMicServer:
         self._connected = True
         # stale audio from a previous session would be prepended to the next utterance
         self._drain_queue()
+        # a reconnect is not a gap; only measure arrivals within one session
+        self._last_frame_time = None
         self._client_connected.set()
         console.print('[bold green][[phone-mic]]: connected from browser! audio streaming started...[/]')
         received_chunks = 0
@@ -158,6 +169,7 @@ class PhoneMicServer:
                     received_chunks += 1
                     if received_chunks == 1:
                         console.print('[bold green][[phone-mic]]: receiving first audio frames from phone mic[/]')
+                    self._note_frame_gap(time.time())
                     self._track_level(msg.data)
                     # drop oldest on overflow so latency stays bounded and we keep
                     # the freshest audio instead of silently discarding new speech
@@ -184,6 +196,22 @@ class PhoneMicServer:
                 f'(code={ws.close_code} chunks={received_chunks} err={err})[/]'
             )
         return ws
+
+    def _note_frame_gap(self, now):
+        '''
+        bursty arrival is invisible otherwise. a stalled link makes the vad end
+        an utterance early, which is indistinguishable from the speaker pausing,
+        so call out anything long enough to be the network rather than a
+        scheduling hiccup.
+        '''
+        gap = 0.0 if self._last_frame_time is None else now - self._last_frame_time
+        self._last_frame_time = now
+        if gap >= FRAME_GAP_WARN_S:
+            self._frame_gaps += 1
+            console.print(
+                f'[dim yellow][[phone-mic]] link gap {gap:.2f}s '
+                f'({self._frame_gaps} total) - dropped audio, not silence[/]'
+            )
 
     def _track_level(self, data):
         '''
