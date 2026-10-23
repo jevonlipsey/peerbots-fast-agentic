@@ -85,7 +85,9 @@ def find_arduino_port():
     '''
     port_env = _port_env()
     if port_env:
-        return port_env
+        resolved = resolve_arduino_port(port_env)
+        if resolved:
+            return resolved
     try:
         from serial.tools import list_ports
     except Exception:
@@ -95,35 +97,49 @@ def find_arduino_port():
         dev = p.device or ''
         if p.vid in _USB_VIDS:
             return dev
-        if fallback is None and (dev.startswith('/dev/ttyACM') or dev.startswith('/dev/ttyUSB')):
+        if fallback is None and (dev.startswith('/dev/ttyACM') or dev.startswith('/dev/ttyUSB') or 'usbmodem' in dev):
             fallback = dev
     return fallback
 
 
-def list_serial_ports():
-    # human-readable port dump for the CLI
+def get_all_serial_ports():
     try:
         from serial.tools import list_ports
-    except Exception as e:
-        console.print(f'[bold red][[ arm: could not enumerate serial ports: {e} ]][/]')
-        return
-    ports = [
-        p
-        for p in list_ports.comports()
-        if p.vid is not None
-        or (p.device or '').startswith('/dev/ttyACM')
-        or (p.device or '').startswith('/dev/ttyUSB')
-    ]
+        return list(list_ports.comports())
+    except Exception:
+        return []
+
+
+def list_serial_ports():
+    # human-readable port dump for the CLI with 0-based indices
+    ports = get_all_serial_ports()
     if not ports:
         console.print(
-            '[dim white][[ arm: no usb serial ports found (plug in the arduino) ]][/]'
+            '[dim white][[ arm: no serial ports found (plug in the arduino) ]][/]'
         )
-        return
-    for p in ports:
+        return []
+    for idx, p in enumerate(ports):
         vid = f'{p.vid:04x}' if p.vid is not None else '----'
         pid = f'{p.pid:04x}' if p.pid is not None else '----'
         mark = '->' if p.vid in _USB_VIDS else '  '
-        console.print(f'{mark} {p.device}  (vid:pid {vid}:{pid}) {p.description}', markup=False)
+        console.print(f'{mark} [{idx}] {p.device}  (vid:pid {vid}:{pid}) {p.description}', markup=False)
+    return ports
+
+
+def resolve_arduino_port(val):
+    '''
+    resolves a port string or integer index (e.g. '0', 0, or '/dev/cu.usbmodem1101')
+    to an actual serial port device path.
+    '''
+    if val is None or str(val).strip() == '':
+        return None
+    val_str = str(val).strip()
+    if val_str.isdigit():
+        idx = int(val_str)
+        ports = get_all_serial_ports()
+        if 0 <= idx < len(ports):
+            return ports[idx].device
+    return val_str
 
 
 class _SerialWorker(threading.Thread):

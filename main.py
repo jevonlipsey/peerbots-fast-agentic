@@ -977,12 +977,24 @@ def main():
         "--arm-port",
         type=str,
         default=os.environ.get("ARDUINO_PORT", ""),
-        help="arduino serial port for the actuator body (default: autodetect)",
+        help="arduino serial port path or index (e.g. 0, /dev/cu.usbmodem1101)",
+    )
+    parser.add_argument(
+        "--arduino-port",
+        type=str,
+        dest="arm_port",
+        help="alias for --arm-port (path or index)",
     )
     parser.add_argument(
         "--list-arm-ports",
         action="store_true",
         help="print serial ports for the actuator body and exit",
+    )
+    parser.add_argument(
+        "--list-arduino-ports",
+        action="store_true",
+        dest="list_arm_ports",
+        help="alias for --list-arm-ports",
     )
     args = parser.parse_args()
     if args.list_mics:
@@ -996,7 +1008,10 @@ def main():
         return
 
     if args.arm_port:
-        os.environ["ARDUINO_PORT"] = args.arm_port
+        from arm_controller import resolve_arduino_port
+        resolved = resolve_arduino_port(args.arm_port)
+        if resolved:
+            os.environ["ARDUINO_PORT"] = resolved
 
     if args.voice:
         KOKORO_VOICE = args.voice
