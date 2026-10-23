@@ -29,7 +29,7 @@ console = Console()
 USE_LOCAL_LLM = False
 OPENAI_API_KEY = os.environ.get('OPENAI_API_KEY', '')
 OLLAMA_URL = 'http://localhost:11434/v1'
-MODEL = os.environ.get('OPENAI_MODEL', 'gpt-4.1-nano')
+MODEL = os.environ.get('OPENAI_MODEL', 'gpt-5.4-nano')
 
 if USE_LOCAL_LLM:
     MODEL = 'gemma4:e4b'
@@ -139,11 +139,19 @@ _VALID_COLORS_MAP = {c.lower(): c for c in VALID_COLORS}
 # pre-compiled regex patterns for streaming json parsing
 _RE_EMOTION = re.compile(r'"emotion"\s*:\s*"([^"]+)"')
 _RE_COLOR = re.compile(r'"color"\s*:\s*"([^"]+)"')
+_RE_TURN_ACTION = re.compile(r'"turn_action"\s*:\s*"([^"]+)"')
 _RE_SPEECH_START = re.compile(r'"speech"\s*:\s*"')
 _RE_UNESCAPED_QUOTE = re.compile(r'(?<!\\)"')
 _RE_TERMINAL_PUNCT = re.compile(r'([.!?]+)\s+')
 _RE_CLAUSE_PUNCT = re.compile(r'(?:([;:,])\s+|([—–]|--)\s*)')
 _RE_LEFTOVER_CLEANUP = re.compile(r'["\}\s]+$')
+
+VALID_TURN_ACTIONS = [
+    'lulo turns to user',
+    'lulo turns away',
+    'lulo maintains gaze',
+    'lulo glances at therapist',
+]
 
 REPLY_SCHEMA = {
     'name': 'peerbots_reply',
@@ -154,8 +162,9 @@ REPLY_SCHEMA = {
             'speech': {'type': 'string'},
             'emotion': {'type': 'string', 'enum': VALID_EMOTIONS},
             'color': {'type': 'string', 'enum': VALID_COLORS},
+            'turn_action': {'type': 'string', 'enum': VALID_TURN_ACTIONS},
         },
-        'required': ['speech', 'emotion', 'color'],
+        'required': ['speech', 'emotion', 'color', 'turn_action'],
         'additionalProperties': False,
     },
 }
@@ -168,10 +177,11 @@ _RESPONSE_FORMAT = {
 
 
 class peerbots_reply(BaseModel):
-    # strict shape the face api needs
+    # strict shape the face api needs plus turn/gaze action
     speech: str
     emotion: str
     color: str
+    turn_action: str = 'lulo turns to user'
 
 
 ### history
@@ -306,11 +316,12 @@ def _fallback_reply():
         'speech': 'Hmm, my mushroom brain glitched for a sec. Could you say that again?',
         'emotion': 'Concerned',
         'color': 'Yellow',
+        'turn_action': 'lulo turns to user',
     }
 
 
 def parse_reply(raw_text):
-    # pull exactly speech, emotion, color out of raw llm text
+    # pull exactly speech, emotion, color, turn_action out of raw llm text
     if not raw_text:
         return _fallback_reply()
     cleaned = raw_text.strip()
@@ -332,10 +343,12 @@ def parse_reply(raw_text):
         except json.JSONDecodeError:
             return _fallback_reply()
     try:
+        raw_turn = data.get('turn_action') or 'lulo turns to user'
         validated = peerbots_reply(
             speech=str(data.get('speech', '')).strip(),
             emotion=_normalize(data.get('emotion'), VALID_EMOTIONS, 'Neutral'),
             color=_normalize(data.get('color'), VALID_COLORS, 'White'),
+            turn_action=_normalize(raw_turn, VALID_TURN_ACTIONS, 'lulo turns to user'),
         )
     except (ValidationError, AttributeError):
         return _fallback_reply()
@@ -345,6 +358,7 @@ def parse_reply(raw_text):
         'speech': validated.speech,
         'emotion': validated.emotion,
         'color': validated.color,
+        'turn_action': validated.turn_action,
     }
 
 
@@ -372,13 +386,14 @@ def _has_min_words(s, min_words):
 class StreamingReplyParser:
     """
     incremental parser for structured json:
-    extracts emotion and color, yields speech clauses on boundaries.
+    extracts emotion, color, and turn_action; yields speech clauses on boundaries.
     """
 
     def __init__(self):
         self.raw_text = ''
         self.emotion = None
         self.color = None
+        self.turn_action = None
         self.speech_buffer = ''
         self.speech_started = False
         self.speech_finished = False
@@ -397,6 +412,11 @@ class StreamingReplyParser:
                 m = _RE_COLOR.search(self.raw_text)
                 if m:
                     self.color = _normalize(m.group(1), _VALID_COLORS_MAP, 'White')
+
+        if not self.turn_action and 'turn_action' in self.raw_text:
+            m = _RE_TURN_ACTION.search(self.raw_text)
+            if m:
+                self.turn_action = _normalize(m.group(1), VALID_TURN_ACTIONS, 'lulo turns to user')
 
         if not self.speech_started:
             if 'speech' in self.raw_text:
@@ -436,6 +456,10 @@ class StreamingReplyParser:
                         m = _RE_COLOR.search(self.raw_text)
                         if m:
                             self.color = _normalize(m.group(1), _VALID_COLORS_MAP, 'White')
+                    if not self.turn_action and 'turn_action' in self.raw_text:
+                        m = _RE_TURN_ACTION.search(self.raw_text)
+                        if m:
+                            self.turn_action = _normalize(m.group(1), VALID_TURN_ACTIONS, 'lulo turns to user')
                     break
 
                 has_term = '.' in self.speech_buffer or '!' in self.speech_buffer or '?' in self.speech_buffer

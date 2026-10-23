@@ -553,10 +553,10 @@ async def benchmark_dialogue_tree_and_pausing():
     from scripts.openai_response import load_system_prompt
     import inspect
 
-    # 1. pause threshold extended to 2.0s
-    assert PAUSE_THRESHOLD >= 2.0, f'pause threshold should be >= 2.0s, got {PAUSE_THRESHOLD}'
-    assert DEFAULT_VAD_SILENCE_S >= 2.0, f'vad silence should be >= 2.0s, got {DEFAULT_VAD_SILENCE_S}'
-    print(f'  -> Extended pause threshold ({PAUSE_THRESHOLD}s default): PASS')
+    # 1. pause threshold check
+    assert PAUSE_THRESHOLD >= 0.8, f'pause threshold should be >= 0.8s, got {PAUSE_THRESHOLD}'
+    assert DEFAULT_VAD_SILENCE_S >= 0.8, f'vad silence should be >= 0.8s, got {DEFAULT_VAD_SILENCE_S}'
+    print(f'  -> Responsive pause threshold ({PAUSE_THRESHOLD}s default): PASS')
 
     # 2. listen_once signature accepts pause_threshold
     sig = inspect.signature(listen_once)
@@ -575,14 +575,25 @@ async def benchmark_dialogue_tree_and_pausing():
     assert GREETING_SPEECH == "Hi! I'm Lulo. Nice to meet you! What's your name?", f'unexpected greeting: {GREETING_SPEECH}'
     print('  -> Startup greeting matches study dialogue tree: PASS')
 
-    # 5. system prompt contains dialogue tree nodes
+    # 5. system prompt contains dialogue tree nodes & gaze cues
     prompt = load_system_prompt()
     assert 'squats' in prompt.lower(), 'prompt must specify squats exercise'
     assert 'curious deer' in prompt.lower(), 'prompt must contain deer backstory'
     assert '90 degrees' in prompt.lower(), 'prompt must contain 90 degrees squat info'
     assert 'throbbing' in prompt.lower(), 'prompt must contain throbbing knee escalation'
     assert 'flag me when' in prompt.lower(), 'prompt must contain break recovery phrasing'
-    print('  -> System prompt study dialogue tree coverage: PASS')
+    assert 'turn_action' in prompt, 'prompt must specify turn_action key'
+    assert 'lulo turns to user' in prompt, 'prompt must specify turn to user'
+    assert 'lulo turns away' in prompt, 'prompt must specify gaze aversion'
+    assert 'lulo glances at therapist' in prompt, 'prompt must specify therapist gaze'
+    print('  -> System prompt study dialogue tree coverage & gaze cues: PASS')
+
+    # 6. reply parsing with turn_action
+    p_res = parse_reply('{"speech": "Hello there", "emotion": "Happy", "color": "Green", "turn_action": "lulo turns to user"}')
+    assert p_res.get('turn_action') == 'lulo turns to user'
+    p_fallback = parse_reply('invalid json')
+    assert 'turn_action' in p_fallback
+    print('  -> parse_reply turn_action schema support: PASS')
 
     return True
 

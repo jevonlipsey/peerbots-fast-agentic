@@ -39,8 +39,9 @@ TRANSCRIPTION_FILE = os.path.join(STATE_DIR, 'transcription.txt')
 ### daemon mode defaults to the system microphone
 MICROPHONE_INDEX = None
 
-DEFAULT_VAD_SILENCE_S = float(os.environ.get('VAD_SILENCE_DURATION_S', '2.0'))
-DEFAULT_NON_SPEAKING_S = float(os.environ.get('VAD_NON_SPEAKING_S', '0.30'))
+DEFAULT_VAD_SILENCE_S = float(os.environ.get('VAD_SILENCE_DURATION_S', '1.0'))
+DEFAULT_NON_SPEAKING_S = float(os.environ.get('VAD_NON_SPEAKING_S', '0.25'))
+DEFAULT_VAD_SPEECH_THRESHOLD = float(os.environ.get('VAD_SPEECH_THRESHOLD', '0.60'))
 
 IS_MAC = platform.system() == 'Darwin'
 _SWIFT_TMP_WAV = os.path.join(tempfile.gettempdir(), f'lulo_stt_{os.getpid()}.wav')
@@ -301,7 +302,7 @@ def listen_audio_silero(
     phrase_time_limit=90.0,
     min_silence_duration_s=DEFAULT_VAD_SILENCE_S,
     non_speaking_duration_s=DEFAULT_NON_SPEAKING_S,
-    speech_threshold=0.45,
+    speech_threshold=DEFAULT_VAD_SPEECH_THRESHOLD,
     nod_callback=None,
 ):
     '''

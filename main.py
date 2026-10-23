@@ -59,9 +59,9 @@ console = Console()
 ### magic constants, tweak here when running from an ide
 ### cli flags override these when present
 TEXT_MODE = False  # true = type instead of using the mic
-MIC_INDEX = 2  # microphone index, run with --list-mics to find yours
+MIC_INDEX = 0  # microphone index, run with --list-mics to find yours
 PAUSE_THRESHOLD = float(
-    os.environ.get("PAUSE_THRESHOLD", "2.0")
+    os.environ.get("PAUSE_THRESHOLD", "1.0")
 )  # seconds of silence before considering speech finished
 USE_DROID_AUDIO = True  # send audio chunks to droid headless daemon
 PEERBOTS_DUAL_AUDIO = os.environ.get("PEERBOTS_DUAL_AUDIO", "true").lower() in (
@@ -323,7 +323,13 @@ async def handle_turn(user_text, tools_list, tool_router):
         if spoken_sentences
         else (final_reply.get("speech", "") if final_reply else "")
     )
-    console.print(f"\n[bold green][[LULO]]:[/] {full_speech}")
+    turn_action_disp = (
+        final_reply.get("turn_action", "lulo turns to user")
+        if final_reply
+        else "lulo turns to user"
+    )
+    console.print(f"\n[bold magenta][[GAZE/TURN]]:[/] {turn_action_disp}")
+    console.print(f"[bold green][[LULO]]:[/] {full_speech}")
 
     emotion_disp = final_reply.get("emotion", "Neutral") if final_reply else "Neutral"
     color_disp = final_reply.get("color", "White") if final_reply else "White"
@@ -338,11 +344,11 @@ async def handle_turn(user_text, tools_list, tool_router):
         console.print(
             f"  [bright_yellow]-> [Metrics] TTFA: {ttfa_s:.2f}s "
             f"(TTFT: {ttft_ms}ms | Clause1: {clause1_ms}ms | TTS1: {tts1_ms}ms | Face: {face_ms}ms) "
-            f"| Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp}[/]"
+            f"| Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp} | Gaze: {turn_action_disp}[/]"
         )
     else:
         console.print(
-            f"  [bright_yellow]-> [Metrics] Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp}[/]"
+            f"  [bright_yellow]-> [Metrics] Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp} | Gaze: {turn_action_disp}[/]"
         )
 
 
@@ -798,7 +804,7 @@ def main():
         "--pause-threshold",
         type=float,
         default=PAUSE_THRESHOLD,
-        help="seconds of silence before speech is considered done (default: 2.0)",
+        help="seconds of silence before speech is considered done (default: 1.0)",
     )
     parser.add_argument(
         "--legacy-vad",
