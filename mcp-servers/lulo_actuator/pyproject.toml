@@ -1,0 +1,8 @@
+[project]
+name = "lulo-actuator"
+version = "0.1.0"
+description = "MCP server exposing Lulo's linear-actuator body to the OpenAI agent"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=2.0",
+]

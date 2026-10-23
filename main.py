@@ -20,7 +20,13 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
-from whisper_stt import IS_MAC, listen_once, start_swift_worker, get_vad_model
+from whisper_stt import (
+    IS_MAC,
+    listen_once,
+    start_swift_worker,
+    get_vad_model,
+    prewarm_whisper,
+)
 from phone_mic_server import PhoneMicServer
 from openai_response import (
     connect_mcp,
@@ -52,6 +58,7 @@ from droid_client import (
 )
 from local_playback import LocalPlaybackQueue
 from phone_playback import PhoneSpeakerQueue
+from arm_controller import ArmController
 
 load_dotenv()
 console = Console()
@@ -59,7 +66,7 @@ console = Console()
 ### magic constants, tweak here when running from an ide
 ### cli flags override these when present
 TEXT_MODE = False  # true = type instead of using the mic
-MIC_INDEX = 0  # microphone index, run with --list-mics to find yours
+MIC_INDEX = None  # microphone index; None = system default, auto-picks a working one
 PAUSE_THRESHOLD = float(
     os.environ.get("PAUSE_THRESHOLD", "1.0")
 )  # seconds of silence before considering speech finished
@@ -87,6 +94,7 @@ GREETING_COLOR = "Green"
 _CURRENT_SWIFT_PROC = None
 _PLAYBACK_QUEUE = None
 _USE_DROID = False
+_ARM = None  # usb serial linear-actuator body, set when --no-arduino is absent
 
 ### dynamic voice speed per emotion
 EMOTION_SPEED_MAP = {
@@ -155,6 +163,9 @@ def make_nod_callback(loop):
 async def send_greeting():
     # spoken greeting once the whole pipeline is ready
     global _USE_DROID, _PLAYBACK_QUEUE
+    if _ARM is not None:
+        # let the body greet too
+        _ARM.fire_emotion(GREETING_EMOTION)
     try:
         if _USE_DROID and _PLAYBACK_QUEUE:
             # fire peerbots face/speech update and synthesize speech concurrently
@@ -232,6 +243,9 @@ async def handle_turn(user_text, tools_list, tool_router):
                 emotion = event["emotion"]
                 color = event["color"]
                 current_emotion = emotion
+                if _ARM is not None:
+                    # physically react to lulo's emotion the moment the face changes
+                    _ARM.fire_emotion(emotion)
                 if _USE_DROID and not PEERBOTS_DUAL_AUDIO:
                     # silent update without speech if dual audio is off
                     fire_peerbots_update("", emotion, color, silent=True)
@@ -378,11 +392,17 @@ def list_mics():
             name = info.get('name', 'unknown')
             if channels > 0:
                 mark = '->' if index == default_index else '  '
-                line = f'{mark} [{index}] {name} ({channels} input channels)'
+                # a device can advertise input channels and still refuse to open at
+                # 16k mono (alsa 'default'/'pulse' aliases bound to a playback card),
+                # so probe it rather than trusting the channel count
+                ok, _ = _probe_mic(index)
+                note = '' if ok else '  [cannot open at 16k mono]'
+                line = f'{mark} [{index}] {name} ({channels} input channels){note}'
+                # markup off, the bracketed index otherwise parses as a rich tag
+                console.print(line, style=None if ok else 'dim', markup=False)
             else:
                 line = f'   [{index}] {name} (output only)'
-            # markup off, the bracketed index otherwise parses as a rich tag
-            console.print(line, style=None if channels > 0 else 'dim', markup=False)
+                console.print(line, style='dim', markup=False)
         console.print('  -> = system default. choose one with: python main.py --mic-index N', style='dim')
     finally:
         pa.terminate()
@@ -431,6 +451,53 @@ def _probe_mic(mic_index):
         pa.terminate()
 
 
+def _first_working_mic_index():
+    '''
+    probe every capture-capable device and return the first that really opens at
+    16k mono.
+
+    pyaudio happily lists alsa plumbing aliases ('default', 'pulse', 'sysdefault')
+    as having many input channels, but opening them fails with 'invalid number of
+    channels' when they resolve to a playback-only card. prefer real hardware, then
+    pulse/pipewire, then the aliases, so a bad default does not look like a dead mic.
+
+    inputs:
+    none
+    outputs:
+    index: first device that opened, or None if none could
+    '''
+    try:
+        import pyaudio
+    except Exception:
+        return None
+    pa = pyaudio.PyAudio()
+    try:
+        candidates = []
+        for index in range(pa.get_device_count()):
+            info = pa.get_device_info_by_index(index)
+            if int(info.get('maxInputChannels', 0)) <= 0:
+                continue
+            candidates.append((index, str(info.get('name', ''))))
+
+        def _rank(item):
+            name = item[1].lower()
+            if name in ('default', 'sysdefault'):
+                return 3
+            if 'pulse' in name or 'pipewire' in name or 'dmix' in name:
+                return 2
+            if 'hdmi' in name:
+                return 1
+            return 0
+
+        for index, _name in sorted(candidates, key=_rank):
+            ok, _detail = _probe_mic(index)
+            if ok:
+                return index
+    finally:
+        pa.terminate()
+    return None
+
+
 try:
     _ExceptionGroupTypes = (BaseExceptionGroup,)
 except NameError:
@@ -472,7 +539,8 @@ async def mic_loop(
                 f"[dim yellow][[ coreml worker failed, whisper fallback: {e} ]]"
             )
     if swift_proc is None:
-        console.print("[dim white][[stt]]: python whisper fallback ready[/]")
+        console.print("[dim white][[stt]]: local whisper (base.en) active, warming model[/]")
+        prewarm_whisper()
 
     recognizer = sr.Recognizer()
     recognizer.pause_threshold = pause_threshold
@@ -495,6 +563,18 @@ async def mic_loop(
     # None and speech_recognition's __exit__ then raises AttributeError on top of
     # the real error, so the failure has to be caught out here instead
     ok, detail = _probe_mic(mic_index)
+    if not ok:
+        # the configured device (or the system default) cannot capture at 16k mono,
+        # so try to find one that can. otherwise an output-only card or a stale
+        # alsa alias looks exactly like a dead microphone.
+        console.print(f"[dim yellow][[ mic {mic_index} unavailable: {detail} ]][/]")
+        alt = _first_working_mic_index()
+        if alt is not None and alt != mic_index:
+            console.print(
+                f"[dim white][[ auto-selected working microphone index {alt} ]][/]"
+            )
+            mic_index = alt
+            ok, detail = _probe_mic(mic_index)
     if not ok:
         console.print(f"[bold red][[ fatal: could not open microphone: {detail} ]][/]")
         console.print("[dim white][[ audio devices on this machine ]][/]")
@@ -534,10 +614,15 @@ async def mic_loop(
                 await handle_turn(text, tools_list, tool_router)
                 # discard buffered audio frames recorded during robot speaking to avoid echo loops
                 try:
-                    if hasattr(source, "stream") and source.stream:
-                        available = source.stream.get_read_available()
+                    # source.stream is a MicrophoneStream wrapper; the raw pyaudio
+                    # stream lives one level down and is what exposes read-available
+                    raw_stream = getattr(
+                        getattr(source, "stream", None), "pyaudio_stream", None
+                    )
+                    if raw_stream is not None:
+                        available = raw_stream.get_read_available()
                         if available > 0:
-                            source.stream.read(available, exception_on_overflow=False)
+                            raw_stream.read(available, exception_on_overflow=False)
                 except Exception:
                     pass
                 console.print("\n[bold dark_orange][[LISTENING]][/]")
@@ -565,7 +650,8 @@ async def phone_mic_loop(
                 f"[dim yellow][[ coreml worker failed, whisper fallback: {e} ]]"
             )
     if swift_proc is None:
-        console.print("[dim white][[stt]]: python whisper fallback ready[/]")
+        console.print("[dim white][[stt]]: local whisper (base.en) active, warming model[/]")
+        prewarm_whisper()
 
     server = PhoneMicServer(port=port, token=token, use_tunnel=use_tunnel)
     await server.start()
@@ -669,8 +755,9 @@ async def amain(
     use_tunnel=False,
     local_audio=False,
     phone_audio=False,
+    enable_arduino=True,
 ):
-    global _USE_DROID, _PLAYBACK_QUEUE, PEERBOTS_DUAL_AUDIO
+    global _USE_DROID, _PLAYBACK_QUEUE, PEERBOTS_DUAL_AUDIO, _ARM
     PEERBOTS_DUAL_AUDIO = enable_dual_audio
     missing = [
         k
@@ -680,6 +767,18 @@ async def amain(
     if missing:
         console.print(f"[bold red][[ missing in .env: {', '.join(missing)} ]]")
         sys.exit(1)
+
+    placeholders = [
+        k
+        for k in ("PEERBOTS_API_KEY", "PEERBOTS_USERNAME")
+        if (os.environ.get(k, "") or "").lower().startswith("your-")
+    ]
+    if placeholders:
+        console.print(
+            f"[bold yellow][[ .env still has placeholder values for "
+            f"{', '.join(placeholders)}: the peerbots face and tablet voice will "
+            f"silently do nothing ]][/]"
+        )
 
     # initialize kokoro tts & the audio sink if requested
     audio_sink = 'tablet'
@@ -740,6 +839,11 @@ async def amain(
                 f"[bold green][[audio]]: streaming Kokoro MPS -> phone browser speakers{mode_str}[/]"
             )
 
+    # bring up the physical body (linear actuator over usb serial) if requested
+    if enable_arduino:
+        _ARM = ArmController()
+        await _ARM.start()
+
     # prewarm openai connection pool and start keepalive
     console.print("[dim white][[ pre-warming openai connection pool... ]][/]")
     await prewarm_openai()
@@ -778,6 +882,8 @@ async def amain(
         stop_openai_keepalive()
         if _PLAYBACK_QUEUE:
             await _PLAYBACK_QUEUE.stop()
+        if _ARM is not None:
+            await _ARM.stop()
         stop_kokoro_process()
         await close_openai_client()
         await close_peerbots_client()
@@ -862,10 +968,35 @@ def main():
     parser.add_argument(
         "--list-mics", action="store_true", help="print all microphones and exit"
     )
+    parser.add_argument(
+        "--no-arduino",
+        action="store_true",
+        help="disable the usb serial linear-actuator body",
+    )
+    parser.add_argument(
+        "--arm-port",
+        type=str,
+        default=os.environ.get("ARDUINO_PORT", ""),
+        help="arduino serial port for the actuator body (default: autodetect)",
+    )
+    parser.add_argument(
+        "--list-arm-ports",
+        action="store_true",
+        help="print serial ports for the actuator body and exit",
+    )
     args = parser.parse_args()
     if args.list_mics:
         list_mics()
         return
+    if args.list_arm_ports:
+        from arm_controller import find_arduino_port, list_serial_ports
+
+        list_serial_ports()
+        console.print(f"autodetect would pick: {find_arduino_port()}", markup=False)
+        return
+
+    if args.arm_port:
+        os.environ["ARDUINO_PORT"] = args.arm_port
 
     if args.voice:
         KOKORO_VOICE = args.voice
@@ -887,6 +1018,7 @@ def main():
                 use_tunnel=args.phone_tunnel,
                 local_audio=args.local_audio,
                 phone_audio=args.phone_audio,
+                enable_arduino=not args.no_arduino,
             )
         )
     except (KeyboardInterrupt, *_ExceptionGroupTypes):

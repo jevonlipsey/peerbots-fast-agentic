@@ -37,7 +37,7 @@ TRANSCRIPTION_FILE = os.path.join(STATE_DIR, 'transcription.txt')
 
 ### mic index now lives in main.py (--mic-index, see --list-mics)
 ### daemon mode defaults to the system microphone
-MICROPHONE_INDEX = None
+MICROPHONE_INDEX = 7
 
 DEFAULT_VAD_SILENCE_S = float(os.environ.get('VAD_SILENCE_DURATION_S', '1.0'))
 DEFAULT_NON_SPEAKING_S = float(os.environ.get('VAD_NON_SPEAKING_S', '0.25'))
@@ -166,12 +166,67 @@ def _audio_to_wav_bytes(audio):
     return audio.get_wav_data(convert_rate=16000, convert_width=2)
 
 
+### local whisper (non-mac stt). speech_recognition's recognize_whisper() calls
+### whisper.load_model() on every single utterance, which reloads the weights from
+### disk (and downloads ~140mb the very first time) for every turn. that makes
+### linux transcription look like a dead stt worker. load the model once and reuse.
+WHISPER_MODEL_NAME = os.environ.get('WHISPER_MODEL', 'base.en')
+_WHISPER_MODEL = None
+_WHISPER_LOCK = threading.Lock()
+
+### auto = mac coreml, otherwise cached local whisper first then google.
+### set STT_BACKEND=google to prefer the network, STT_BACKEND=whisper to stay offline.
+STT_BACKEND = os.environ.get('STT_BACKEND', 'auto').lower()
+
+
+def get_whisper_model():
+    # load and cache the whisper model once for the life of the process
+    global _WHISPER_MODEL
+    if _WHISPER_MODEL is None:
+        with _WHISPER_LOCK:
+            if _WHISPER_MODEL is None:
+                import whisper
+                _WHISPER_MODEL = whisper.load_model(WHISPER_MODEL_NAME)
+    return _WHISPER_MODEL
+
+
+def prewarm_whisper():
+    # load (and first-run download) the model in the background so the first
+    # utterance is not stalled for ~13s behind torch warmup
+    if IS_MAC:
+        return
+    try:
+        threading.Thread(target=get_whisper_model, daemon=True).start()
+    except Exception:
+        pass
+
+
+def _audio_to_float32(audio):
+    # whisper wants 16khz float32 mono in [-1, 1]
+    import numpy as np
+    raw = audio.get_raw_data(convert_rate=16000, convert_width=2)
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def _transcribe_whisper(audio):
+    model = get_whisper_model()
+    if model is None:
+        raise RuntimeError('whisper model unavailable')
+    result = model.transcribe(
+        _audio_to_float32(audio),
+        language='en',
+        fp16=False,
+        condition_on_previous_text=False,
+    )
+    return (result.get('text') or '').strip()
+
+
 def transcribe_audio(recognizer, audio, swift_proc=None):
     '''
     multi-tier transcription:
     tier 1: coreml swift worker on mac
-    tier 2: google speech recognition
-    tier 3: local whisper base model
+    tier 2: cached local whisper (reliable, offline) on non-mac
+    tier 3: google speech recognition (network fallback)
 
     inputs:
     recognizer: speech_recognition recognizer
@@ -181,6 +236,14 @@ def transcribe_audio(recognizer, audio, swift_proc=None):
     text: transcribed string
     swift_proc: updated process handle
     '''
+    if STT_BACKEND == 'google':
+        use_whisper, use_google = False, True
+    elif STT_BACKEND in ('whisper', 'local'):
+        use_whisper, use_google = True, False
+    else:  # auto
+        use_whisper = not IS_MAC
+        use_google = True
+
     # tier 1: coreml swift worker
     if IS_MAC and swift_proc is not None and swift_proc.poll() is None:
         try:
@@ -199,25 +262,28 @@ def transcribe_audio(recognizer, audio, swift_proc=None):
                 # if text is empty, the audio was silence/room noise; do not fall through to cpu whisper
                 return text, swift_proc
         except Exception as e:
-            console.print(f'[dim yellow][[ coreml transcribe error: {e}, falling back to google ]][/]')
+            console.print(f'[dim yellow][[ coreml transcribe error: {e}, falling back ]][/]')
 
-    # tier 2: google speech recognition fallback
-    try:
-        text = recognizer.recognize_google(audio).strip()
-        return text, swift_proc
-    except sr.UnknownValueError:
-        return '', swift_proc
-    except Exception as e:
-        console.print(f'[dim yellow][[ google speech error: {e}, falling back to whisper ]][/]')
+    # tier 2: cached local whisper. an empty result means silence, so we do not
+    # fall through to google and burn a network round-trip on every pause.
+    if use_whisper:
+        try:
+            return _transcribe_whisper(audio), swift_proc
+        except sr.UnknownValueError:
+            return '', swift_proc
+        except Exception as e:
+            console.print(f'[dim yellow][[ whisper error: {e}, falling back to google ]][/]')
 
-    # tier 3: local whisper fallback
-    try:
-        return recognizer.recognize_whisper(audio, model='base.en').strip(), swift_proc
-    except sr.UnknownValueError:
-        return '', swift_proc
-    except Exception as e:
-        console.print(f'[bold red][[ whisper fallback error: {e} ]][/]')
-        return '', swift_proc
+    # tier 3: google speech recognition
+    if use_google:
+        try:
+            return recognizer.recognize_google(audio).strip(), swift_proc
+        except sr.UnknownValueError:
+            return '', swift_proc
+        except Exception as e:
+            console.print(f'[dim yellow][[ google speech error: {e} ]][/]')
+
+    return '', swift_proc
 
 
 CONTINUATION_CUES = {
@@ -510,6 +576,7 @@ def main():
             console.print(f'[dim yellow][[ coreml worker failed, whisper fallback: {e} ]]')
     if swift_proc is None:
         console.print('[dim white][[STT_WORKER]]: python whisper fallback ready[/]')
+        prewarm_whisper()
 
     r = sr.Recognizer()
     r.pause_threshold = DEFAULT_VAD_SILENCE_S
