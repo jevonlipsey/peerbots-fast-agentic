@@ -173,6 +173,10 @@ def make_nod_callback(loop):
     return _on_nod
 
 
+# kokoro is a freshly-launched local server at this point, so the prewarm burst
+# is paced rather than fired all at once
+PREWARM_CONCURRENCY = 4
+
 SCRIPTED_LINES_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "config", "scripted_lines.json"
 )
@@ -249,18 +253,47 @@ async def prewarm_scripted_lines():
     clauses = _scripted_clauses()
     if not clauses:
         return 0
-    results = await asyncio.gather(
-        *(
-            synthesize_speech(
-                clause,
-                voice=KOKORO_VOICE,
-                speed=get_voice_speed_for_emotion(emotion, KOKORO_SPEED),
+
+    # dedupe on the real cache key: variants of the same line share clauses
+    wanted = {}
+    for clause, emotion in clauses:
+        wanted.setdefault(
+            (clause, get_voice_speed_for_emotion(emotion, KOKORO_SPEED)), None
+        )
+
+    # ensure_kokoro_ready returns as soon as the health check passes, and firing
+    # forty-odd requests at a server that has only just come up loses a third of
+    # them. an uncached scripted line costs ~300ms of synthesis mid-demo, so this
+    # paces the burst and retries once rather than accepting a partial cache.
+    gate = asyncio.Semaphore(PREWARM_CONCURRENCY)
+
+    async def _one(clause, speed):
+        async with gate:
+            return await synthesize_speech(clause, voice=KOKORO_VOICE, speed=speed)
+
+    async def _pass(keys):
+        results = await asyncio.gather(
+            *(_one(c, sp) for c, sp in keys), return_exceptions=True
+        )
+        ok, failed = 0, []
+        for key, r in zip(keys, results):
+            if isinstance(r, (bytes, bytearray)) and r:
+                ok += 1
+            else:
+                failed.append(key)
+        return ok, failed
+
+    cached, failed = await _pass(list(wanted))
+    if failed:
+        await asyncio.sleep(0.5)
+        retried, still_failed = await _pass(failed)
+        cached += retried
+        if still_failed:
+            console.print(
+                f"[dim yellow]\\[\\[audio]]: {len(still_failed)} scripted clause(s) "
+                f"would not synthesize; those lines pay full tts[/]"
             )
-            for clause, emotion in clauses
-        ),
-        return_exceptions=True,
-    )
-    return sum(1 for r in results if isinstance(r, (bytes, bytearray)) and r)
+    return cached
 
 
 async def send_greeting():
@@ -1007,6 +1040,10 @@ async def amain(
                 console.print(
                     f"[dim white][[ cached {cached} scripted dialogue-tree clauses "
                     f"(on-script replies skip tts) ]][/]"
+                )
+            else:
+                console.print(
+                    "[dim yellow][[ no scripted audio cached; every reply pays full tts ]][/]"
                 )
             if phone_audio:
                 if not use_phone_mic:

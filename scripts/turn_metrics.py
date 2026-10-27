@@ -231,5 +231,16 @@ def format_console(record):
         if v is not None:
             parts.append(f'{label} {v:.0f}')
     total = to.get('speech_end_to_audible')
-    head = f'{total / 1000.0:.2f}s to audible' if total is not None else 'incomplete'
+    if total is not None:
+        head = f'{total / 1000.0:.2f}s to audible'
+    else:
+        # text mode and the tablet sink never go through the vad, so there is no
+        # speech-end stamp to measure from. say so rather than calling it
+        # incomplete, which reads like a failure.
+        legacy = to.get('legacy_ttfa')
+        head = (
+            f'{legacy / 1000.0:.2f}s to audio (no mic, span starts at the turn)'
+            if legacy is not None
+            else 'no audio this turn'
+        )
     return f'{head}  ({" | ".join(parts)})'
