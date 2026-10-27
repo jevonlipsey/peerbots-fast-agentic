@@ -21,6 +21,38 @@ The pipeline coordinates speech capture, LLM reasoning, face animation, and audi
 
 On macOS, speech-to-text uses a compiled Swift CoreML worker (FluidAudio) for fast local transcription, with Google Speech Recognition and local Whisper as automatic fallbacks.
 
+### Turn-taking
+
+Endpointing is semantic rather than a timer. Silero VAD still does frame-level
+speech detection, but **Smart Turn v3.2** reads the audio and decides whether the
+speaker has actually finished a thought. A short 200ms pause triggers that
+question instead of answering it, and the old 1.0s silence window survives only as
+a hard cap — so a complete turn ends in roughly 250ms while someone mid-sentence
+still gets their time.
+
+Lulo can also be **interrupted**. The microphone stays open while she speaks, and
+confident speech over her cuts the audio mid-word and drops the rest of the turn.
+On the phone path the browser owns the audio nodes, so a clip stops instantly on a
+control frame. This depends on echo cancellation being on, or she hears her own
+voice and interrupts herself.
+
+Fetch the endpointer model once before first use:
+
+```bash
+python scripts/smart_turn.py --download
+```
+
+Without it the pipeline still runs, falling back to the fixed silence window.
+
+### Measuring latency
+
+Every turn appends one JSON record to `state/turns.jsonl` spanning the user's last
+speech frame through to audible sound, broken into endpoint wait, STT, TTFT, first
+clause, TTS, dispatch and playback start. `OPTIMIZATION_LOG.md` holds the measured
+baseline. Treat any latency claim that cannot be seen in `turns.jsonl` as unproven —
+the previous harness simulated its three most expensive stages with
+`asyncio.sleep`.
+
 ---
 
 ## 1. Prerequisites
@@ -102,6 +134,9 @@ Once you see `[[LISTENING]]` in the terminal, Lulo is calibrated and ready to co
 | `--mic-index <N>` | Use a specific microphone device index | `python main.py --mic-index 2` |
 | `--pause-threshold <S>` | Seconds of silence before speech is finalized (default `1.2`s) | `python main.py --pause-threshold 1.0` |
 | `--no-droid` | Disable external Droid audio streaming and use PEERbots tablet audio directly | `python main.py --no-droid` |
+| `--preflight` | Check every subsystem and exit. Run this before a demo | `python main.py --preflight --phone-mic` |
+| `--no-smart-turn` | Fall back to the fixed silence window instead of semantic endpointing | `python main.py --no-smart-turn` |
+| `--keep-history` | Carry the previous session's conversation over instead of starting fresh | `python main.py --keep-history` |
 
 ---
 
@@ -124,6 +159,15 @@ The pipeline supports two output modes for audio and speech:
 
 ### Persona & Dialogue Rules
 Lulo's personality, physical therapy companion persona, deer injury backstory, and pain escalation rules are defined in `config/system_prompt.md`.
+
+### Dialogue tree audio
+
+`config/scripted_lines.json` lists every Lulo utterance in the HRI-F26 tree with
+its emotion. At startup each line is pushed through the real streaming parser to
+recover its true clause boundaries, then synthesized at the exact speed that
+emotion will request live, so on-script replies are served from the Kokoro cache
+at 0ms. Keep it in sync with `config/system_prompt.md` — a cache key that differs
+by one character is a miss.
 
 ### Adding MCP Tools
 External tool capabilities are defined in `mcp_config.json` at the project root. To add a new tool server:
@@ -154,6 +198,7 @@ peerbots-fast-agentic/
   .env.example             # template environment file
   config/
     system_prompt.md       # Lulo PT companion persona, dialogue tree, and response rules
+    scripted_lines.json    # dialogue-tree lines prewarmed into the TTS cache
   scripts/
     whisper_stt.py         # multi-tier STT (CoreML Swift worker -> Google SR -> Whisper)
     openai_response.py     # streaming LLM cognitive layer with structured emotion/color parsing
@@ -163,7 +208,11 @@ peerbots-fast-agentic/
     lib/
       file_utils.py        # safe file I/O helpers
       mcp_loader.py        # dynamic MCP server loader
+    smart_turn.py          # semantic end-of-turn detection (Smart Turn v3.2, ONNX)
+    turn_metrics.py        # real end-to-end turn timing -> state/turns.jsonl
+    preflight.py           # pre-demo subsystem check
   stt-coreml/              # Swift CoreML speech-to-text worker (macOS)
+  models/                  # downloaded model weights (gitignored)
   state/                   # conversation history and runtime state files
   skills/                  # agent skills directory
 ```

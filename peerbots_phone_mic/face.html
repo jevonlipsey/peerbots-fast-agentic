@@ -14,6 +14,11 @@ iframe{position:fixed;inset:0;width:100%;height:100%;border:0;z-index:1}
 
 #bar{position:fixed;z-index:9999;left:8px;bottom:8px;display:flex;align-items:center;gap:8px;color:#fff;background:#000c;padding:7px 11px;border-radius:8px;font-size:13px;pointer-events:none;max-width:88vw}
 #meter{width:60px;height:6px;border-radius:3px;background:#fff3;overflow:hidden;flex:none}
+/* stage kill switch: the live transcript shows lulo answering overheard room
+   chatter (lunch plans, bench talk about 12V supplies), because nothing tells her
+   who is being addressed. one tap stops her listening without killing the session. */
+#mute{position:fixed;z-index:9999;right:8px;bottom:8px;padding:10px 14px;border:0;border-radius:8px;font-size:13px;font-weight:600;background:#3ddc84;color:#06240f;box-shadow:0 4px 14px #0008}
+#mute.off{background:#ff5f56;color:#2a0806}
 #fill{height:100%;width:0%;background:#3ddc84;transition:width .06s linear}
 </style>
 </head>
@@ -21,8 +26,17 @@ iframe{position:fixed;inset:0;width:100%;height:100%;border:0;z-index:1}
 <iframe src="https://app.peerbots.org/face" allow="autoplay; camera; microphone; fullscreen" allowfullscreen></iframe>
 <button id="start">Enable microphone<small>so the robot can hear you</small></button>
 <div id="bar"><span id="status">Not connected</span><span id="meter"><span id="fill"></span></span></div>
+<button id="mute" hidden>Listening</button>
 <script>
-const startBtn=document.getElementById('start'),statusEl=document.getElementById('status'),fillEl=document.getElementById('fill');
+const startBtn=document.getElementById('start'),statusEl=document.getElementById('status'),fillEl=document.getElementById('fill'),muteBtn=document.getElementById('mute');
+let micEnabled=true;
+muteBtn.onclick=()=>{
+  micEnabled=!micEnabled;
+  muteBtn.textContent=micEnabled?'Listening':'Muted';
+  muteBtn.classList.toggle('off',!micEnabled);
+  // the level meter deliberately keeps running while muted, so a muted mic still
+  // looks obviously alive rather than indistinguishable from a broken one
+};
 let audioContext,stream,socket,processor;
 const setStatus=t=>{statusEl.textContent=t;};
 
@@ -53,6 +67,7 @@ function connectSocket(){
     failStreak=0;retryDelay=1500;
     setStatus('Live — speak');
     startBtn.style.display='none';
+    muteBtn.hidden=false;
   };
   s.onclose=()=>{
     if(socket!==s)return;// superseded by a newer attempt, do not double-schedule
@@ -178,6 +193,7 @@ startBtn.onclick=async()=>{
       for(let i=0;i<input.length;i++)sum+=input[i]*input[i];
       fillEl.style.width=Math.min(100,Math.sqrt(sum/input.length)*400)+'%';
 
+      if(!micEnabled)return;
       if(!socket||socket.readyState!==WebSocket.OPEN)return;
       const joined=new Float32Array(carry.length+input.length);
       joined.set(carry);joined.set(input,carry.length);
