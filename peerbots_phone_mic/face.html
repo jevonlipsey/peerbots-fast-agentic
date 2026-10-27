@@ -121,9 +121,13 @@ function playNextClip(){
   const src=audioContext.createBufferSource();
   src.buffer=speechQueue.shift();
   src.connect(audioContext.destination);
+  const first=!liveSource;
   liveSource=src;
   src.onended=()=>{speakingClip=false;if(liveSource===src)playNextClip();};
   src.start();
+  // time-to-audible is the number that matters, and only the handset knows when
+  // sound actually left the speaker
+  if(first)notify('playback_started');
 }
 
 // barge-in: drop whatever is queued and cut the clip that is sounding right now.

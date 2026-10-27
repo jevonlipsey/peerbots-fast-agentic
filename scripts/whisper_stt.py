@@ -20,6 +20,9 @@ import threading
 import time
 
 import speech_recognition as sr
+
+import smart_turn
+import turn_metrics
 from rich.console import Console
 
 console = Console()
@@ -53,6 +56,13 @@ MIN_SPEECH_FRAMES = int(os.environ.get('VAD_MIN_SPEECH_FRAMES', '4'))
 NOISE_FLOOR_MIN_FRAMES = 15
 NOISE_FLOOR_SILENCE_MARGIN = 0.10
 NOISE_FLOOR_SPEECH_MARGIN = 0.25
+
+# with semantic endpointing the silence window stops being the decision and
+# becomes the trigger to ask the question. a complete turn ends after this long;
+# an incomplete one keeps waiting, up to the caller's window as a hard cap.
+SMART_TURN_PROBE_S = float(os.environ.get('SMART_TURN_PROBE_S', '0.20'))
+# don't re-run inference every frame while someone is mid-thought
+SMART_TURN_REPROBE_S = float(os.environ.get('SMART_TURN_REPROBE_S', '0.20'))
 
 IS_MAC = platform.system() == 'Darwin'
 _SWIFT_TMP_WAV = os.path.join(tempfile.gettempdir(), f'lulo_stt_{os.getpid()}.wav')
@@ -380,6 +390,7 @@ def listen_audio_silero(
     non_speaking_duration_s=DEFAULT_NON_SPEAKING_S,
     speech_threshold=DEFAULT_VAD_SPEECH_THRESHOLD,
     nod_callback=None,
+    use_smart_turn=True,
 ):
     '''
     captures one utterance using neural silero-vad for forgiving endpointing.
@@ -393,6 +404,9 @@ def listen_audio_silero(
     speech_threshold: vad onset probability floor (default 0.60); the effective
         onset and silence thresholds float above the measured room noise floor
     nod_callback: callable(seconds) triggered at 10s, 25s, 45s of continuous speech
+    use_smart_turn: consult the semantic end-of-turn model, so min_silence_duration_s
+        acts as a hard cap rather than the decision. falls back to the fixed window
+        when the model is unavailable.
     outputs:
     AudioData instance
     '''
@@ -426,6 +440,16 @@ def listen_audio_silero(
     ambient_probs = collections.deque(maxlen=40)
     silence_threshold = speech_threshold - 0.15
     effective_speech_threshold = speech_threshold
+    measured_floor = None
+
+    # semantic endpointing: probe early, and only fall back to the full window
+    # when the model says the speaker is not finished
+    smart_enabled = use_smart_turn and smart_turn.get_session() is not None
+    probe_frames = max(1, int(round(SMART_TURN_PROBE_S / frame_duration_s)))
+    reprobe_frames = max(1, int(round(SMART_TURN_REPROBE_S / frame_duration_s)))
+    next_probe_at = probe_frames
+    smart_prob = None
+    smart_frames = smart_turn.WINDOW_SAMPLES // 512
 
     float_buf = np.empty(512, dtype=np.float32)
     inv_scale = np.float32(1.0 / 32768.0)
@@ -467,6 +491,7 @@ def listen_audio_silero(
                     if len(ambient_probs) >= NOISE_FLOOR_MIN_FRAMES:
                         ranked = sorted(ambient_probs)
                         floor = ranked[int(0.9 * (len(ranked) - 1))]
+                        measured_floor = floor
                         # keep silence strictly under the onset threshold, or
                         # nothing would ever count as the end of a phrase
                         silence_threshold = min(
@@ -512,14 +537,66 @@ def listen_audio_silero(
                     # past the limit it stayed frozen below the threshold, so
                     # capture ran on until the stream closed - a hard hang.
                     limit_reached = True
+                    endpoint_at = time.monotonic()
+                    turn_metrics.note_capture(
+                        speech_end=endpoint_at,
+                        endpoint_at=endpoint_at,
+                        silence_window_s=min_silence_duration_s,
+                        noise_floor=measured_floor,
+                    )
                     break
 
                 if prob < silence_threshold:
                     silence_counter += 1
+
+                    if (
+                        smart_enabled
+                        and silence_counter >= next_probe_at
+                        and silence_counter < silence_frames_needed
+                    ):
+                        next_probe_at = silence_counter + reprobe_frames
+                        # the model wants the whole current turn, most recent last
+                        tail = b''.join(spoken_frames[-smart_frames:])
+                        samples = np.frombuffer(tail, dtype=np.int16).astype(
+                            np.float32
+                        ) * inv_scale
+                        complete, smart_prob = smart_turn.is_turn_complete(samples)
+                        if complete:
+                            endpoint_at = time.monotonic()
+                            console.print(
+                                f'[dim white]\\[\\[smart-turn]]: turn complete '
+                                f'(p={smart_prob:.2f}) after '
+                                f'{silence_counter * frame_duration_s:.2f}s silence[/]'
+                            )
+                            turn_metrics.note_capture(
+                                speech_end=endpoint_at
+                                - (silence_counter * frame_duration_s),
+                                endpoint_at=endpoint_at,
+                                silence_window_s=silence_counter * frame_duration_s,
+                                noise_floor=measured_floor,
+                            )
+                            silence_counter = silence_frames_needed
+                            break
+
                     if silence_counter >= silence_frames_needed:
+                        # the span a person actually waits through starts at the
+                        # last frame that was still speech, not here
+                        endpoint_at = time.monotonic()
+                        if smart_enabled and smart_prob is not None:
+                            console.print(
+                                f'[dim white]\\[\\[smart-turn]]: window cap reached '
+                                f'(last p={smart_prob:.2f})[/]'
+                            )
+                        turn_metrics.note_capture(
+                            speech_end=endpoint_at - (silence_counter * frame_duration_s),
+                            endpoint_at=endpoint_at,
+                            silence_window_s=min_silence_duration_s,
+                            noise_floor=measured_floor,
+                        )
                         break
                 else:
                     silence_counter = 0
+                    next_probe_at = probe_frames
 
         if limit_reached:
             break
@@ -541,6 +618,7 @@ def listen_once(
     use_silero=True,
     nod_callback=None,
     pause_threshold=None,
+    use_smart_turn=True,
 ):
     '''
     block for one complete utterance with adaptive continuation endpointing.
@@ -568,6 +646,7 @@ def listen_once(
                 min_silence_duration_s=silence_s,
                 non_speaking_duration_s=DEFAULT_NON_SPEAKING_S,
                 nod_callback=nod_callback,
+                use_smart_turn=use_smart_turn,
             )
         else:
             recognizer.pause_threshold = silence_s
@@ -584,6 +663,7 @@ def listen_once(
         return ''
 
     text, _ = transcribe_audio(recognizer, audio, swift_proc)
+    turn_metrics.note_stt_done()
     if is_hallucination(text):
         return ''
     text = text.strip()
@@ -599,6 +679,7 @@ def listen_once(
                     timeout=1.5,
                     phrase_time_limit=20,
                     min_silence_duration_s=continuation_silence_s,
+                use_smart_turn=use_smart_turn,
                     nod_callback=nod_callback,
                 )
             else:

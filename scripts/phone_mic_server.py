@@ -7,6 +7,8 @@ from pathlib import Path
 from queue import Empty, Queue
 
 from aiohttp import WSMsgType, web
+
+import turn_metrics
 from rich.console import Console
 
 try:
@@ -168,7 +170,7 @@ class PhoneMicServer:
         # only one browser may stream at a time. multiple tabs interleaving pcm
         # into one queue sounds like noise and never transcribes.
         if self._client_ws is not None and not self._client_ws.closed:
-            console.print('[dim yellow][[phone-mic]]: another browser already streaming, rejecting this one (close extra tabs)[/]')
+            console.print('[dim yellow]\\[\\[phone-mic]]: another browser already streaming, rejecting this one (close extra tabs)[/]')
             return web.Response(status=409, text='another phone mic is already streaming')
 
         ws = web.WebSocketResponse(max_msg_size=1024 * 1024, heartbeat=30)
@@ -180,14 +182,14 @@ class PhoneMicServer:
         # a reconnect is not a gap; only measure arrivals within one session
         self._last_frame_time = None
         self._client_connected.set()
-        console.print('[bold green][[phone-mic]]: connected from browser! audio streaming started...[/]')
+        console.print('[bold green]\\[\\[phone-mic]]: connected from browser! audio streaming started...[/]')
         received_chunks = 0
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
                     received_chunks += 1
                     if received_chunks == 1:
-                        console.print('[bold green][[phone-mic]]: receiving first audio frames from phone mic[/]')
+                        console.print('[bold green]\\[\\[phone-mic]]: receiving first audio frames from phone mic[/]')
                     self._note_frame_gap(time.time())
                     self._track_level(msg.data)
                     # drop oldest on overflow so latency stays bounded and we keep
@@ -204,7 +206,7 @@ class PhoneMicServer:
                             self._dropped_chunks += 1
                             if self._dropped_chunks % 25 == 1:
                                 console.print(
-                                    f'[dim yellow][[phone-mic]]: reader is behind, dropped '
+                                    f'[dim yellow]\\[\\[phone-mic]]: reader is behind, dropped '
                                     f'{self._dropped_chunks} audio chunks (speech may be clipped)[/]'
                                 )
                         except Exception:
@@ -220,8 +222,10 @@ class PhoneMicServer:
                     kind = (payload or {}).get('type')
                     if kind in ('playback_done', 'playback_stopped'):
                         self._playback_done.set()
+                    elif kind == 'playback_started':
+                        turn_metrics.note_playback_started()
                 elif msg.type == WSMsgType.ERROR:
-                    console.print(f'[dim yellow][[phone-mic]]: ws error: {ws.exception()}[/]')
+                    console.print(f'[dim yellow]\\[\\[phone-mic]]: ws error: {ws.exception()}[/]')
         finally:
             self._connected = False
             self._client_ws = None
@@ -231,7 +235,7 @@ class PhoneMicServer:
             # the vad is currently collecting. stale audio is cleared on connect.
             err = None if ws.exception() is None else repr(ws.exception())
             console.print(
-                f'[dim yellow][[phone-mic]]: disconnected '
+                f'[dim yellow]\\[\\[phone-mic]]: disconnected '
                 f'(code={ws.close_code} chunks={received_chunks} err={err})[/]'
             )
         return ws
@@ -248,7 +252,7 @@ class PhoneMicServer:
         if gap >= FRAME_GAP_WARN_S:
             self._frame_gaps += 1
             console.print(
-                f'[dim yellow][[phone-mic]] link gap {gap:.2f}s '
+                f'[dim yellow]\\[\\[phone-mic]] link gap {gap:.2f}s '
                 f'({self._frame_gaps} total) - dropped audio, not silence[/]'
             )
 
@@ -278,7 +282,7 @@ class PhoneMicServer:
         if self._rms_frames >= 16000:
             rms = (self._rms_sum / self._rms_frames) ** 0.5
             bar = '#' * min(30, int(rms * 300))
-            console.print(f'[dim cyan][[phone-mic]] input rms {rms:.4f} |{bar}[/]')
+            console.print(f'[dim cyan]\\[\\[phone-mic]] input rms {rms:.4f} |{bar}[/]')
             self._rms_sum = 0.0
             self._rms_frames = 0
 
@@ -300,7 +304,7 @@ class PhoneMicServer:
         try:
             probe.bind(('0.0.0.0', self.port))
         except OSError as e:
-            console.print(f'[bold red][[phone-mic]]: port {self.port} is already in use ({e})[/]')
+            console.print(f'[bold red]\\[\\[phone-mic]]: port {self.port} is already in use ({e})[/]')
             console.print('[bold red]  another "main.py --phone-mic" is probably still running.[/]')
             console.print('[bold red]  stop it (ctrl-c, or: pkill -f "main.py --phone-mic") or pass --phone-port <other>[/]')
             raise SystemExit(1) from e
@@ -327,7 +331,7 @@ class PhoneMicServer:
         await self.site.start()
         scheme = 'https' if ssl_ctx else 'http'
         token_str = f'?token={self.token}' if self.token else ''
-        console.print(f'[bold green][[phone-mic]]: server listening on {scheme}://localhost:{self.port}/{token_str}[/]')
+        console.print(f'[bold green]\\[\\[phone-mic]]: server listening on {scheme}://localhost:{self.port}/{token_str}[/]')
 
         if self.use_tunnel:
             await self._start_cloudflared_tunnel()
@@ -340,10 +344,10 @@ class PhoneMicServer:
     async def _start_cloudflared_tunnel(self):
         cloudflared_bin = PHONE_MIC_DIR / 'tools' / 'cloudflared'
         if not cloudflared_bin.exists():
-            console.print(f'[dim yellow][[phone-mic]]: cloudflared binary not found at {cloudflared_bin}[/]')
+            console.print(f'[dim yellow]\\[\\[phone-mic]]: cloudflared binary not found at {cloudflared_bin}[/]')
             return
         token_str = f'?token={self.token}' if self.token else ''
-        console.print('[dim white][[phone-mic]]: requesting Cloudflare tunnel...[/]')
+        console.print('[dim white]\\[\\[phone-mic]]: requesting Cloudflare tunnel...[/]')
         import re
         try:
             self.tunnel_proc = await asyncio.create_subprocess_exec(
@@ -365,13 +369,13 @@ class PhoneMicServer:
                     match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line_str)
                     if match:
                         self.tunnel_url = match.group(0)
-                        console.print(f'[bold green][[phone-mic]]: Public HTTPS URL: {self.tunnel_url}/{token_str}[/]')
+                        console.print(f'[bold green]\\[\\[phone-mic]]: Public HTTPS URL: {self.tunnel_url}/{token_str}[/]')
                         console.print('  [dim white]Open this URL on any phone (no USB cable or ADB required)[/]')
                         break
 
             asyncio.create_task(_find_url())
         except Exception as e:
-            console.print(f'[dim yellow][[phone-mic]]: could not start cloudflared tunnel: {e}[/]')
+            console.print(f'[dim yellow]\\[\\[phone-mic]]: could not start cloudflared tunnel: {e}[/]')
 
     async def stop(self):
         # release any read parked waiting for the phone to come back

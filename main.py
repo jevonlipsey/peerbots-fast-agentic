@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+import smart_turn
 from whisper_stt import (
     IS_MAC,
     listen_once,
@@ -60,6 +61,7 @@ from droid_client import (
 from local_playback import LocalPlaybackQueue
 from phone_playback import PhoneSpeakerQueue
 from arm_controller import ArmController
+import turn_metrics
 
 load_dotenv()
 console = Console()
@@ -96,6 +98,7 @@ _CURRENT_SWIFT_PROC = None
 _PLAYBACK_QUEUE = None
 _USE_DROID = False
 _ARM = None  # usb serial linear-actuator body, set when --no-arduino is absent
+_AUDIO_SINK = "tablet"  # droid | mac | phone | tablet, recorded in turn metrics
 
 ### dynamic voice speed per emotion
 EMOTION_SPEED_MAP = {
@@ -124,6 +127,13 @@ def get_voice_speed_for_emotion(emotion, base_speed=KOKORO_SPEED):
     if mult is not None:
         return round(mult * (base_speed / 1.0), 2)
     return base_speed
+
+
+def whisper_stt_probe():
+    '''the silence this build probes at, for the startup banner'''
+    from whisper_stt import SMART_TURN_PROBE_S
+
+    return SMART_TURN_PROBE_S
 
 
 def make_nod_callback(loop):
@@ -308,6 +318,14 @@ async def handle_turn(user_text, tools_list, tool_router):
     )
 
     turn_start = time.time()
+    # the real span starts where the user stopped talking, which only the vad
+    # thread saw. the old metric started here, after stt had already returned.
+    timer = turn_metrics.TurnTimer(
+        capture=turn_metrics.take_capture(),
+        model=os.environ.get("OPENAI_MODEL", ""),
+        audio_sink=_AUDIO_SINK,
+    )
+    turn_metrics.arm_playback()
     if _USE_DROID and _PLAYBACK_QUEUE:
         _PLAYBACK_QUEUE.reset_turn()
 
@@ -325,7 +343,9 @@ async def handle_turn(user_text, tools_list, tool_router):
     chunk_order_events[0].set()
 
     try:
+        timer.mark("llm_start")
         async for event in stream_peerbots_reply(user_text, tools_list, tool_router):
+            timer.mark("first_token")
             # cancel thinking filler as soon as the first stream event arrives
             if think_task and not think_task.done():
                 think_task.cancel()
@@ -358,6 +378,7 @@ async def handle_turn(user_text, tools_list, tool_router):
                 spoken_sentences.append(sent)
                 if chunk_idx == 0:
                     first_clause_time = time.time()
+                timer.mark("first_clause")
 
                 if _USE_DROID and _PLAYBACK_QUEUE:
                     # concurrently synthesize this sentence with kokoro and stream into playback queue
@@ -373,6 +394,7 @@ async def handle_turn(user_text, tools_list, tool_router):
                         s_ms = int((time.time() - s_start) * 1000)
                         if idx == 0:
                             tts1_ms = s_ms
+                        timer.mark("first_synth")
                         if idx not in chunk_order_events:
                             chunk_order_events[idx] = asyncio.Event()
                         try:
@@ -381,6 +403,7 @@ async def handle_turn(user_text, tools_list, tool_router):
                                 if not first_audio_sent:
                                     first_audio_sent = True
                                     first_audio_time = time.time()
+                                    timer.mark("first_audio_sent")
                                 await _PLAYBACK_QUEUE.enqueue(audio_data, chunk_idx=idx)
                         finally:
                             next_idx = idx + 1
@@ -449,21 +472,28 @@ async def handle_turn(user_text, tools_list, tool_router):
     emotion_disp = final_reply.get("emotion", "Neutral") if final_reply else "Neutral"
     color_disp = final_reply.get("color", "White") if final_reply else "White"
 
+    # the sink reports when sound actually left the speaker, where it can
+    started = turn_metrics.take_playback_started()
+    if started is not None:
+        timer.stamps["playback_started"] = started
+    timer.mark("turn_done")
+    timer.set("emotion", emotion_disp)
+    timer.set("color", color_disp)
+    timer.set("turn_action", turn_action_disp)
+    timer.set("chunks", len(spoken_sentences))
+    record = timer.write()
+
+    console.print(
+        f"  [bright_yellow]-> [Metrics] {turn_metrics.format_console(record)}"
+        f" | {emotion_disp} / {color_disp} | Gaze: {turn_action_disp}[/]"
+    )
     if first_audio_time:
-        ttfa_s = first_audio_time - turn_start
-        ttft_ms = metrics.get("ttft_ms", 0)
-        clause1_ms = (
-            int((first_clause_time - turn_start) * 1000) if first_clause_time else 0
-        )
-        face_ms = metrics.get("face_ms", 0)
+        # kept alongside the real span so the old figure stays comparable
         console.print(
-            f"  [bright_yellow]-> [Metrics] TTFA: {ttfa_s:.2f}s "
-            f"(TTFT: {ttft_ms}ms | Clause1: {clause1_ms}ms | TTS1: {tts1_ms}ms | Face: {face_ms}ms) "
-            f"| Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp} | Gaze: {turn_action_disp}[/]"
-        )
-    else:
-        console.print(
-            f"  [bright_yellow]-> [Metrics] Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp} | Gaze: {turn_action_disp}[/]"
+            f"  [dim]   legacy TTFA (post-stt, pre-upload): "
+            f"{first_audio_time - turn_start:.2f}s"
+            f" | TTFT {metrics.get('ttft_ms', 0)}ms | TTS1 {tts1_ms}ms"
+            f" | Total {total_turn_s:.2f}s[/]"
         )
 
 
@@ -627,6 +657,7 @@ async def mic_loop(
     tool_router,
     pause_threshold=PAUSE_THRESHOLD,
     use_silero=True,
+    use_smart_turn=True,
 ):
     # blocking mic loop, runs until ctrl-c
     global _CURRENT_SWIFT_PROC
@@ -640,7 +671,7 @@ async def mic_loop(
                 f"[dim yellow][[ coreml worker failed, whisper fallback: {e} ]]"
             )
     if swift_proc is None:
-        console.print("[dim white][[stt]]: local whisper (base.en) active, warming model[/]")
+        console.print("[dim white]\\[\\[stt]]: local whisper (base.en) active, warming model[/]")
         prewarm_whisper()
 
     recognizer = sr.Recognizer()
@@ -650,11 +681,11 @@ async def mic_loop(
     vad_available = use_silero and (get_vad_model() is not None)
     if vad_available:
         console.print(
-            f"[dim white][[stt]]: neural silero-vad endpointing active (pause_threshold={pause_threshold}s)[/]"
+            f"[dim white]\\[\\[stt]]: neural silero-vad endpointing active (pause_threshold={pause_threshold}s)[/]"
         )
     else:
         console.print(
-            f"[dim white][[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]"
+            f"[dim white]\\[\\[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]"
         )
 
     loop = asyncio.get_running_loop()
@@ -700,6 +731,7 @@ async def mic_loop(
                 use_silero=vad_available,
                 nod_callback=nod_cb,
                 pause_threshold=pause_threshold,
+                use_smart_turn=use_smart_turn,
             )
             if IS_MAC and swift_proc is not None and swift_proc.poll() is not None:
                 console.print("[dim white][[ reviving crashed stt worker... ]][/]")
@@ -737,6 +769,7 @@ async def phone_mic_loop(
     use_tunnel=False,
     pause_threshold=PAUSE_THRESHOLD,
     use_silero=True,
+    use_smart_turn=True,
     phone_audio=False,
 ):
     # stream audio from phone browser over websocket
@@ -751,7 +784,7 @@ async def phone_mic_loop(
                 f"[dim yellow][[ coreml worker failed, whisper fallback: {e} ]]"
             )
     if swift_proc is None:
-        console.print("[dim white][[stt]]: local whisper (base.en) active, warming model[/]")
+        console.print("[dim white]\\[\\[stt]]: local whisper (base.en) active, warming model[/]")
         prewarm_whisper()
 
     server = PhoneMicServer(port=port, token=token, use_tunnel=use_tunnel)
@@ -769,11 +802,11 @@ async def phone_mic_loop(
     vad_available = use_silero and (get_vad_model() is not None)
     if vad_available:
         console.print(
-            f"[dim white][[stt]]: neural silero-vad endpointing active (pause_threshold={pause_threshold}s)[/]"
+            f"[dim white]\\[\\[stt]]: neural silero-vad endpointing active (pause_threshold={pause_threshold}s)[/]"
         )
     else:
         console.print(
-            f"[dim white][[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]"
+            f"[dim white]\\[\\[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]"
         )
 
     loop = asyncio.get_running_loop()
@@ -806,6 +839,7 @@ async def phone_mic_loop(
                 use_silero=vad_available,
                 nod_callback=nod_cb,
                 pause_threshold=pause_threshold,
+                use_smart_turn=use_smart_turn,
             )
             if IS_MAC and swift_proc is not None and swift_proc.poll() is not None:
                 console.print("[dim white][[ reviving crashed stt worker... ]][/]")
@@ -849,6 +883,7 @@ async def amain(
     pause_threshold=PAUSE_THRESHOLD,
     enable_droid=USE_DROID_AUDIO,
     use_silero=True,
+    use_smart_turn=True,
     enable_dual_audio=PEERBOTS_DUAL_AUDIO,
     use_phone_mic=False,
     phone_mic_port=8443,
@@ -859,7 +894,7 @@ async def amain(
     enable_arduino=True,
     fresh_history=True,
 ):
-    global _USE_DROID, _PLAYBACK_QUEUE, PEERBOTS_DUAL_AUDIO, _ARM
+    global _USE_DROID, _PLAYBACK_QUEUE, PEERBOTS_DUAL_AUDIO, _ARM, _AUDIO_SINK
     PEERBOTS_DUAL_AUDIO = enable_dual_audio
 
     if fresh_history:
@@ -914,6 +949,7 @@ async def amain(
             elif await ais_droid_reachable():
                 audio_sink = 'droid'
 
+    _AUDIO_SINK = audio_sink
     if audio_sink == 'tablet':
         if enable_droid:
             reasons = []
@@ -932,7 +968,7 @@ async def amain(
             _PLAYBACK_QUEUE = DroidPlaybackQueue()
             await _PLAYBACK_QUEUE.start()
             console.print(
-                f"[bold green][[audio]]: streaming Kokoro MPS -> Droid daemon (100.119.180.97){mode_str}[/]"
+                f"[bold green]\\[\\[audio]]: streaming Kokoro MPS -> Droid daemon (100.119.180.97){mode_str}[/]"
             )
             try:
                 probe_res = await probe_droid_daemon()
@@ -949,18 +985,38 @@ async def amain(
             _PLAYBACK_QUEUE = LocalPlaybackQueue()
             await _PLAYBACK_QUEUE.start()
             console.print(
-                f"[bold green][[audio]]: streaming Kokoro MPS -> local speakers{mode_str}[/]"
+                f"[bold green]\\[\\[audio]]: streaming Kokoro MPS -> local speakers{mode_str}[/]"
             )
         else:
             # the queue is built in phone_mic_loop once the server exists
             console.print(
-                f"[bold green][[audio]]: streaming Kokoro MPS -> phone browser speakers{mode_str}[/]"
+                f"[bold green]\\[\\[audio]]: streaming Kokoro MPS -> phone browser speakers{mode_str}[/]"
             )
 
     # bring up the physical body (linear actuator over usb serial) if requested
     if enable_arduino:
         _ARM = ArmController()
         await _ARM.start()
+
+    # semantic endpointing: load and warm the graph now, not on the first turn
+    if use_smart_turn:
+        if smart_turn.model_available():
+            if await asyncio.to_thread(smart_turn.prewarm):
+                console.print(
+                    "[bold green]\\[\\[stt]]: semantic end-of-turn detection active "
+                    f"(probe at {whisper_stt_probe()}s, cap at {pause_threshold}s)[/]"
+                )
+            else:
+                console.print(
+                    "[dim yellow]\\[\\[stt]]: smart-turn model failed to load, "
+                    "using the fixed silence window[/]"
+                )
+        else:
+            console.print(
+                "[dim yellow]\\[\\[stt]]: no smart-turn model; endpointing falls back to "
+                f"a fixed {pause_threshold}s window. "
+                "get it with: python scripts/smart_turn.py --download[/]"
+            )
 
     # prewarm openai connection pool and start keepalive
     console.print("[dim white][[ pre-warming openai connection pool... ]][/]")
@@ -984,6 +1040,7 @@ async def amain(
                     use_tunnel=use_tunnel,
                     pause_threshold=pause_threshold,
                     use_silero=use_silero,
+                    use_smart_turn=use_smart_turn,
                     phone_audio=phone_audio,
                 )
             else:
@@ -993,6 +1050,7 @@ async def amain(
                     tool_router,
                     pause_threshold=pause_threshold,
                     use_silero=use_silero,
+                    use_smart_turn=use_smart_turn,
                 )
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
@@ -1029,6 +1087,11 @@ def main():
         type=float,
         default=PAUSE_THRESHOLD,
         help="seconds of silence before speech is considered done (default: 1.0)",
+    )
+    parser.add_argument(
+        "--no-smart-turn",
+        action="store_true",
+        help="disable semantic end-of-turn detection and use the fixed silence window",
     )
     parser.add_argument(
         "--legacy-vad",
@@ -1149,6 +1212,7 @@ def main():
                 pause_threshold=args.pause_threshold,
                 enable_droid=not args.no_droid,
                 use_silero=not args.legacy_vad,
+                use_smart_turn=not args.no_smart_turn,
                 enable_dual_audio=not args.no_dual_audio,
                 use_phone_mic=args.phone_mic,
                 phone_mic_port=args.phone_port,

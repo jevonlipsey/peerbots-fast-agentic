@@ -253,31 +253,31 @@ class ArmController:
             self.simulate = True
             if self.port:
                 console.print(
-                    f'[bold yellow][[arm]]: could not open {self.port}: '
+                    f'[bold yellow]\\[\\[arm]]: could not open {self.port}: '
                     f'{self.last_error or "unknown error"}[/]'
                 )
             console.print(
-                '[dim yellow][[arm]]: no arduino detected, lulo body running in '
+                '[dim yellow]\\[\\[arm]]: no arduino detected, lulo body running in '
                 'simulation mode (commands are logged, not sent)[/]'
             )
             if 'permission denied' in (self.last_error or '').lower():
                 console.print(
-                    '[bold yellow][[arm]]: fix the port permission by joining '
+                    '[bold yellow]\\[\\[arm]]: fix the port permission by joining '
                     'dialout: sudo usermod -aG dialout $USER  (then log out and '
                     'back in, or run `newgrp dialout`)[/]'
                 )
         else:
-            console.print(f'[bold green][[arm]]: lulo body online on {self.port} @ {BAUD}[/]')
+            console.print(f'[bold green]\\[\\[arm]]: lulo body online on {self.port} @ {BAUD}[/]')
 
         try:
             self.control_server = await asyncio.start_server(
                 self._handle_client, CONTROL_HOST, CONTROL_PORT
             )
             console.print(
-                f'[dim white][[arm]]: control socket on {CONTROL_HOST}:{CONTROL_PORT} for mcp tools[/]'
+                f'[dim white]\\[\\[arm]]: control socket on {CONTROL_HOST}:{CONTROL_PORT} for mcp tools[/]'
             )
         except Exception as e:
-            console.print(f'[dim yellow][[arm]]: control socket unavailable: {e}[/]')
+            console.print(f'[dim yellow]\\[\\[arm]]: control socket unavailable: {e}[/]')
 
     async def stop(self):
         self._running = False
@@ -297,7 +297,7 @@ class ArmController:
     def _note_serial_failure(self, detail):
         self.last_error = detail
         if self.connected:
-            console.print(f'[bold red][[arm]]: serial link lost: {detail}[/]')
+            console.print(f'[bold red]\\[\\[arm]]: serial link lost: {detail}[/]')
         self.connected = False
         self.simulate = True
 
