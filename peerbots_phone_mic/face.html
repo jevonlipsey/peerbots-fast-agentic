@@ -79,13 +79,27 @@ function connectSocket(){
   s.onerror=()=>{setStatus('Socket error — is the laptop still running?');};
   // the laptop sends tts back down this same socket; binary = wav to speak on the handset
   s.onmessage=(event)=>{
-    if(event.data instanceof ArrayBuffer)enqueueClip(event.data);
+    if(event.data instanceof ArrayBuffer){enqueueClip(event.data);return;}
+    // text frames are control messages from the laptop, not speech
+    try{
+      const msg=JSON.parse(event.data);
+      if(msg&&msg.type==='interrupt')stopSpeaking();
+    }catch(e){}
   };
 }
 
 // speech plays through the same audioContext the mic uses, so the tap that
 // enables the microphone also unlocks playback for the whole session
-let speechQueue=[],speakingClip=false;
+let speechQueue=[],speakingClip=false,liveSource=null;
+
+// the laptop used to guess when the handset had finished speaking by adding the
+// clip duration to the time it sent the bytes. decode and wifi both drift, so the
+// microphone could reopen while lulo was still talking. the browser is the only
+// thing that actually knows, so it says so.
+function notify(type){
+  if(!socket||socket.readyState!==WebSocket.OPEN)return;
+  try{socket.send(JSON.stringify({type:type}));}catch(e){}
+}
 
 function enqueueClip(arrayBuffer){
   if(!audioContext)return;
@@ -96,24 +110,47 @@ function enqueueClip(arrayBuffer){
 }
 
 function playNextClip(){
-  if(speakingClip||!speechQueue.length||!audioContext)return;
+  if(speakingClip||!audioContext)return;
+  if(!speechQueue.length){
+    // nothing queued behind the clip that just ended, so the turn's audio is done
+    if(liveSource){liveSource=null;notify('playback_done');}
+    return;
+  }
   speakingClip=true;
   if(audioContext.state==='suspended')audioContext.resume().catch(()=>{});
   const src=audioContext.createBufferSource();
   src.buffer=speechQueue.shift();
   src.connect(audioContext.destination);
-  src.onended=()=>{speakingClip=false;playNextClip();};
+  liveSource=src;
+  src.onended=()=>{speakingClip=false;if(liveSource===src)playNextClip();};
   src.start();
+}
+
+// barge-in: drop whatever is queued and cut the clip that is sounding right now.
+// clearing liveSource first stops the onended handler pulling the next clip.
+function stopSpeaking(){
+  speechQueue=[];
+  const src=liveSource;
+  liveSource=null;
+  speakingClip=false;
+  if(src){
+    try{src.onended=null;src.stop();}catch(e){}
+  }
+  notify('playback_stopped');
 }
 
 startBtn.onclick=async()=>{
   startBtn.disabled=true;
   try{
-    // these default to chrome's phone-call tuning, which assumes a mouth 2cm away.
-    // at arm's length the noise gate cuts word onsets down to digital silence and
-    // the auto gain pumps the room noise floor up until the vad fires on it, so ask
-    // for the raw signal and let whisper handle level.
-    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:false,noiseSuppression:false,autoGainControl:false},video:false});
+    // the noise gate and auto gain default to chrome's phone-call tuning, which
+    // assumes a mouth 2cm away. at arm's length the gate cuts word onsets down to
+    // digital silence and the auto gain pumps the room noise floor up until the vad
+    // fires on it, so both stay off and whisper handles level.
+    // echo cancellation is a separate subsystem and does stay on: it is a linear
+    // canceller keyed on the known playback signal, so it never touches word onsets,
+    // and this handset is speaker and microphone at once. without it lulo hears her
+    // own tts coming back in and barges in on herself.
+    stream=await navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:false,autoGainControl:false},video:false});
   }catch(err){
     setStatus('Mic blocked ('+err.name+') — allow mic in browser settings');
     startBtn.disabled=false;
@@ -144,10 +181,17 @@ startBtn.onclick=async()=>{
       const count=Math.floor(joined.length/ratio);
       if(!count){carry=joined;return;}
       const out=new Int16Array(count);
+      // average every source sample that falls inside the output sample's window
+      // rather than point-sampling two of them. linear interpolation is no kind of
+      // low-pass, so at 48k everything above 8k folds straight back into the band
+      // as aliasing noise, which costs vad probability quality and stt accuracy at
+      // the same time.
+      const win=Math.max(1,Math.round(ratio));
       for(let i=0;i<count;i++){
-        const pos=Math.floor(i*ratio),next=Math.min(pos+1,joined.length-1);
-        const t=i*ratio-pos;
-        const sample=Math.max(-1,Math.min(1,joined[pos]*(1-t)+joined[next]*t));
+        const start=Math.round(i*ratio);
+        let acc=0,n=0;
+        for(let j=start;j<start+win&&j<joined.length;j++){acc+=joined[j];n++;}
+        const sample=Math.max(-1,Math.min(1,n?acc/n:0));
         out[i]=sample<0?sample*32768:sample*32767;
       }
       carry=joined.slice(Math.floor(count*ratio));

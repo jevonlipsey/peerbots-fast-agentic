@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import ssl
 import time
@@ -29,16 +30,24 @@ PHONE_MIC_IDLE_BAIL = 20.0
 # "the microphone is bad".
 FRAME_GAP_WARN_S = 0.25
 
+# ~20s of 16k pcm at the page's ~85ms chunk size. the queue stays bounded so a
+# wedged reader cannot grow it without limit, but it is now deep enough that a
+# slow stt call does not silently eat the start of the next utterance.
+PHONE_MIC_QUEUE_CHUNKS = 240
+
 
 class PhoneMicStream:
     '''
     mimics pyaudio stream read interface so whisper_stt silero vad can read directly
     '''
 
-    def __init__(self, audio_queue):
+    def __init__(self, audio_queue, is_connected=None):
         self.queue = audio_queue
         self.buffer = bytearray()
         self._closed = False
+        # lets a read give up quickly when the page is gone, instead of waiting
+        # out the full idle window for audio that cannot arrive
+        self._is_connected = is_connected
 
     def read(self, num_samples, exception_on_overflow=False):
         '''
@@ -61,6 +70,10 @@ class PhoneMicStream:
                 idle = 0.0
             except Empty:
                 idle += 0.5
+                if self._is_connected is not None and not self._is_connected():
+                    # no browser attached, so nothing is coming. bail now rather
+                    # than blocking the listen thread for the full idle window.
+                    break
                 if idle >= PHONE_MIC_IDLE_BAIL:
                     break
             except Exception:
@@ -91,8 +104,8 @@ class PhoneMicSource:
     SAMPLE_RATE = 16000
     SAMPLE_WIDTH = 2
 
-    def __init__(self, audio_queue):
-        self.stream = PhoneMicStream(audio_queue)
+    def __init__(self, audio_queue, is_connected=None):
+        self.stream = PhoneMicStream(audio_queue, is_connected=is_connected)
         self.SAMPLE_RATE = 16000
         self.SAMPLE_WIDTH = 2
 
@@ -109,9 +122,15 @@ class PhoneMicServer:
         self.port = port
         self.token = token or os.getenv('PEERBOTS_TOKEN', '')
         self.use_tunnel = use_tunnel
-        # ~2s of 16k pcm. deeper than this and the vad is always chewing on stale
-        # audio, so live speech queues up behind it and looks like a dead mic
-        self.audio_queue = Queue(maxsize=50)
+        # the listen thread blocks on a synchronous stt round trip while the phone
+        # keeps streaming, so the bound has to cover that gap or the oldest frames
+        # get dropped and the next utterance loses its opening words. 50 chunks was
+        # only ~4.2s at ~85ms a chunk, which a slow transcribe eats through.
+        self.audio_queue = Queue(maxsize=PHONE_MIC_QUEUE_CHUNKS)
+        self._dropped_chunks = 0
+        # set by the page when handset audio really finishes, awaited by the
+        # playback queue instead of sleeping on an estimate
+        self._playback_done = asyncio.Event()
         self._rms_sum = 0.0
         self._rms_frames = 0
         self._last_frame_time = None
@@ -179,8 +198,28 @@ class PhoneMicServer:
                         try:
                             self.audio_queue.get_nowait()
                             self.audio_queue.put_nowait(msg.data)
+                            # losing frames means the reader is far behind, which
+                            # costs words off the front of an utterance. it used to
+                            # happen silently, so nobody knew the mic was lossy.
+                            self._dropped_chunks += 1
+                            if self._dropped_chunks % 25 == 1:
+                                console.print(
+                                    f'[dim yellow][[phone-mic]]: reader is behind, dropped '
+                                    f'{self._dropped_chunks} audio chunks (speech may be clipped)[/]'
+                                )
                         except Exception:
                             pass
+                elif msg.type == WSMsgType.TEXT:
+                    # control frames from the page. playback_done/playback_stopped
+                    # are the real end of handset audio, which the laptop used to
+                    # have to estimate from send time plus clip duration.
+                    try:
+                        payload = json.loads(msg.data)
+                    except Exception:
+                        payload = None
+                    kind = (payload or {}).get('type')
+                    if kind in ('playback_done', 'playback_stopped'):
+                        self._playback_done.set()
                 elif msg.type == WSMsgType.ERROR:
                     console.print(f'[dim yellow][[phone-mic]]: ws error: {ws.exception()}[/]')
         finally:
@@ -349,7 +388,7 @@ class PhoneMicServer:
             await self.runner.cleanup()
 
     def get_source(self):
-        source = PhoneMicSource(self.audio_queue)
+        source = PhoneMicSource(self.audio_queue, is_connected=self.is_connected)
         # keep the handle so shutdown can release a read that is blocked on a
         # phone which has stopped sending
         self.stream = source.stream
@@ -373,6 +412,47 @@ class PhoneMicServer:
             return True
         except Exception:
             return False
+
+    async def send_control(self, kind):
+        '''
+        send a json control frame to the page (e.g. 'interrupt' for barge-in).
+
+        inputs:
+        kind: control type string
+        outputs:
+        sent: boolean, false when no browser is attached
+        '''
+        ws = self._client_ws
+        if ws is None or ws.closed:
+            return False
+        try:
+            await ws.send_str(json.dumps({'type': kind}))
+            return True
+        except Exception:
+            return False
+
+    def reset_playback_ack(self):
+        '''arm the ack before sending a turn's audio'''
+        self._playback_done.clear()
+
+    async def wait_playback_ack(self, timeout):
+        '''
+        wait for the page to confirm handset audio finished.
+
+        inputs:
+        timeout: seconds to wait before falling back to the duration estimate
+        outputs:
+        acked: True if the browser confirmed, False on timeout
+        '''
+        try:
+            await asyncio.wait_for(self._playback_done.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def is_connected(self):
+        ws = self._client_ws
+        return ws is not None and not ws.closed
 
     async def wait_for_client(self, timeout=None):
         '''
