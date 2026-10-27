@@ -1219,6 +1219,11 @@ def main():
         "--list-mics", action="store_true", help="print all microphones and exit"
     )
     parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="check every subsystem and exit (run this before a demo)",
+    )
+    parser.add_argument(
         "--keep-history",
         action="store_true",
         help="carry the previous session's conversation over instead of starting fresh",
@@ -1252,6 +1257,17 @@ def main():
         help="alias for --list-arm-ports",
     )
     args = parser.parse_args()
+    if args.preflight:
+        from preflight import run as run_preflight
+
+        ok = asyncio.run(
+            run_preflight(
+                phone_port=args.phone_port,
+                check_arduino=not args.no_arduino,
+                check_mic=not args.phone_mic,
+            )
+        )
+        sys.exit(0 if ok else 1)
     if args.list_mics:
         list_mics()
         return
