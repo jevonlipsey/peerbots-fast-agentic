@@ -30,6 +30,7 @@ from whisper_stt import (
 from phone_mic_server import PhoneMicServer
 from openai_response import (
     connect_mcp,
+    start_fresh_session,
     stream_peerbots_reply,
     prewarm_openai,
     start_openai_keepalive,
@@ -160,6 +161,96 @@ def make_nod_callback(loop):
     return _on_nod
 
 
+SCRIPTED_LINES_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "scripted_lines.json"
+)
+
+
+def _scripted_clauses():
+    '''
+    the exact tts cache keys an on-script reply will ask for.
+
+    the cache is keyed on the clause text the streaming parser emits, not on the
+    whole reply, so prewarming a full dialogue-tree line would never be hit. each
+    line is therefore pushed through that same parser to recover its real clause
+    boundaries.
+
+    inputs:
+    none
+    outputs:
+    list of (clause_text, emotion) pairs
+    '''
+    import json
+
+    from openai_response import StreamingReplyParser
+
+    try:
+        with open(SCRIPTED_LINES_FILE, encoding="utf-8") as fh:
+            lines = json.load(fh).get("lines", [])
+    except Exception:
+        return []
+
+    clauses = []
+    for entry in lines:
+        speech = entry.get("speech", "")
+        emotion = entry.get("emotion", "Neutral")
+        if not speech:
+            continue
+        # shaped exactly like a real strict-schema reply so the parser splits it
+        # the way it will at run time
+        payload = json.dumps(
+            {
+                "emotion": emotion,
+                "color": "White",
+                "turn_action": "lulo turns to user",
+                "speech": speech,
+            }
+        )
+        parser = StreamingReplyParser()
+        parts = []
+        # feed in small slices so clause flushing behaves as it does on a token
+        # stream rather than on one complete string
+        for i in range(0, len(payload), 8):
+            parts.extend(parser.feed(payload[i : i + 8]))
+        parts.extend(parser.finish())
+        for clause in parts:
+            if clause.strip():
+                clauses.append((clause, emotion))
+    return clauses
+
+
+async def prewarm_scripted_lines():
+    '''
+    synthesize every scripted clause ahead of time, at its live speed.
+
+    the demo follows a known dialogue tree, so each of those replies can be served
+    from the in-memory kokoro cache for 0ms instead of ~300ms of synthesis. the
+    speed has to match exactly or the lookup misses: the generic prewarm used
+    DEFAULT_SPEED while live turns ask for get_voice_speed_for_emotion(...), so
+    before this nothing but the greeting ever hit.
+
+    inputs:
+    none
+    outputs:
+    count of clauses cached
+    '''
+    clauses = _scripted_clauses()
+    if not clauses:
+        return 0
+    results = await asyncio.gather(
+        *(
+            synthesize_speech(
+                clause,
+                voice=KOKORO_VOICE,
+                speed=get_voice_speed_for_emotion(emotion, KOKORO_SPEED),
+            )
+            for clause, emotion in clauses
+        ),
+        return_exceptions=True,
+    )
+    return sum(1 for r in results if isinstance(r, (bytes, bytearray)) and r)
+
+
 async def send_greeting():
     # spoken greeting once the whole pipeline is ready
     global _USE_DROID, _PLAYBACK_QUEUE
@@ -176,7 +267,10 @@ async def send_greeting():
                 silent=not PEERBOTS_DUAL_AUDIO,
             )
             audio_bytes = await synthesize_speech(
-                GREETING_SPEECH, voice=KOKORO_VOICE, speed=KOKORO_SPEED
+                GREETING_SPEECH,
+                voice=KOKORO_VOICE,
+                # same speed the scripted prewarm cached it at, or the lookup misses
+                speed=get_voice_speed_for_emotion(GREETING_EMOTION, KOKORO_SPEED),
             )
             if audio_bytes:
                 await _PLAYBACK_QUEUE.enqueue(audio_bytes, chunk_idx=0)
@@ -246,8 +340,15 @@ async def handle_turn(user_text, tools_list, tool_router):
                 if _ARM is not None:
                     # physically react to lulo's emotion the moment the face changes
                     _ARM.fire_emotion(emotion)
-                if _USE_DROID and not PEERBOTS_DUAL_AUDIO:
-                    # silent update without speech if dual audio is off
+                if _USE_DROID:
+                    # fire the face the moment the emotion token lands, in dual
+                    # audio mode too. the only face update in that mode used to be
+                    # the one carrying the full speech text at the very end of the
+                    # turn, and the peerbots cloud can take 4-5s to deliver it, so
+                    # lulo would speak a Concerned/Red escalation line while still
+                    # wearing the previous face. this update carries no speech, so
+                    # it cannot duplicate audio; the later send still drives the
+                    # mouth for lip-sync.
                     fire_peerbots_update("", emotion, color, silent=True)
                 console.print(f"  [dim white]-> [face] {emotion} / {color}[/]")
 
@@ -756,9 +857,20 @@ async def amain(
     local_audio=False,
     phone_audio=False,
     enable_arduino=True,
+    fresh_history=True,
 ):
     global _USE_DROID, _PLAYBACK_QUEUE, PEERBOTS_DUAL_AUDIO, _ARM
     PEERBOTS_DUAL_AUDIO = enable_dual_audio
+
+    if fresh_history:
+        archived = start_fresh_session()
+        if archived:
+            console.print(
+                f"[dim white][[ previous session archived to {os.path.basename(archived)}, "
+                f"starting fresh ]][/]"
+            )
+    else:
+        console.print("[dim yellow][[ keeping previous session history ]][/]")
     missing = [
         k
         for k in ("OPENAI_API_KEY", "PEERBOTS_API_KEY", "PEERBOTS_USERNAME")
@@ -786,6 +898,12 @@ async def amain(
         console.print("[dim white][[ checking kokoro tts & droid audio daemon... ]][/]")
         koko_ok = await ensure_kokoro_ready()
         if koko_ok:
+            cached = await prewarm_scripted_lines()
+            if cached:
+                console.print(
+                    f"[dim white][[ cached {cached} scripted dialogue-tree clauses "
+                    f"(on-script replies skip tts) ]][/]"
+                )
             if phone_audio:
                 if not use_phone_mic:
                     console.print("[bold red][[ --phone-audio needs --phone-mic ]][/]")
@@ -969,6 +1087,11 @@ def main():
         "--list-mics", action="store_true", help="print all microphones and exit"
     )
     parser.add_argument(
+        "--keep-history",
+        action="store_true",
+        help="carry the previous session's conversation over instead of starting fresh",
+    )
+    parser.add_argument(
         "--no-arduino",
         action="store_true",
         help="disable the usb serial linear-actuator body",
@@ -1034,6 +1157,7 @@ def main():
                 local_audio=args.local_audio,
                 phone_audio=args.phone_audio,
                 enable_arduino=not args.no_arduino,
+                fresh_history=not args.keep_history,
             )
         )
     except (KeyboardInterrupt, *_ExceptionGroupTypes):

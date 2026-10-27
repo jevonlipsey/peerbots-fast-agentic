@@ -492,17 +492,37 @@ async def benchmark_naturalness_and_flow():
     """
     print('\n--- 3. Naturalness & Conversational Flow Assertions ---')
 
-    # 1. session context and opener anti-repetition
+    # 1. session hint text must never invalidate the cacheable prompt prefix
     reset_session_context()
     _record_turn_metadata("Great! Let's get started", 'Happy')
     _record_turn_metadata('Great! You got this', 'Happy')
     _record_turn_metadata('Great! Keep going', 'Happy')
 
+    # the hint used to lead with '[session: turn N]' and was prepended to the
+    # system prompt, so the leading bytes of the request changed every turn and
+    # ~3k tokens of prompt plus history could never hit the prompt cache. the
+    # counter is metrics-only now, and the hints are off by default because they
+    # push the model off the study's verbatim dialogue-tree lines.
     prefix = _build_session_prefix()
-    assert '[session: turn 1]' in prefix
-    assert "Avoid recent openers: 'Great! Let's get', 'Great! You got', 'Great! Keep going'" in prefix
-    assert "Emotion dampening: you used 'Happy' for 3 turns in a row" in prefix
-    print('  -> Session context opener anti-repetition & dampening: PASS')
+    assert 'session: turn' not in prefix, 'turn marker would break prompt caching'
+    assert prefix == '', 'anti-repetition hints should be opt-in via LULO_ANTI_REPETITION'
+    assert get_session_context()['turn_count'] == 1, 'turn count still tracked for metrics'
+
+    # with the flag on, the hints come back - but as tail text, never a prefix
+    import scripts.openai_response as _oresp
+    _oresp.ANTI_REPETITION = True
+    try:
+        reset_session_context()
+        _record_turn_metadata("Great! Let's get started", 'Happy')
+        _record_turn_metadata('Great! You got this', 'Happy')
+        _record_turn_metadata('Great! Keep going', 'Happy')
+        hinted = _build_session_prefix()
+        assert "Avoid recent openers: 'Great! Let's get', 'Great! You got', 'Great! Keep going'" in hinted
+        assert "Emotion dampening: you used 'Happy' for 3 turns in a row" in hinted
+        assert 'session: turn' not in hinted
+    finally:
+        _oresp.ANTI_REPETITION = False
+    print('  -> Session hints are tail-only and opt-in (prompt prefix stays cacheable): PASS')
 
     # 2. emotion voice speed scaling
     assert get_voice_speed_for_emotion('Happy', 1.0) == 1.12
@@ -587,6 +607,16 @@ async def benchmark_dialogue_tree_and_pausing():
     assert 'lulo turns away' in prompt, 'prompt must specify gaze aversion'
     assert 'lulo glances at therapist' in prompt, 'prompt must specify therapist gaze'
     print('  -> System prompt study dialogue tree coverage & gaze cues: PASS')
+
+    # 5b. face fields must precede speech on the wire, or the face, the body and
+    # the emotion->speed map all fire after the utterance has already been spoken
+    from scripts.openai_response import REPLY_SCHEMA
+    _order = list(REPLY_SCHEMA['schema']['properties'].keys())
+    assert _order.index('emotion') < _order.index('speech'), 'emotion must stream before speech'
+    assert _order.index('color') < _order.index('speech'), 'color must stream before speech'
+    assert _order.index('turn_action') < _order.index('speech'), 'turn_action must stream before speech'
+    assert REPLY_SCHEMA['schema']['required'][-1] == 'speech'
+    print('  -> Reply schema streams face state before speech: PASS')
 
     # 6. reply parsing with turn_action
     p_res = parse_reply('{"speech": "Hello there", "emotion": "Happy", "color": "Green", "turn_action": "lulo turns to user"}')

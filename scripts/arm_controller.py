@@ -242,6 +242,12 @@ class ArmController:
             self.worker.start()
             await asyncio.to_thread(self.worker.ready.wait, 6.0)
             self.connected = bool(self.worker.ok)
+            if self.connected:
+                # start every session from a known, centred pose
+                try:
+                    await self.home()
+                except Exception:
+                    pass
 
         if not self.connected:
             self.simulate = True
@@ -402,6 +408,17 @@ class ArmController:
 
     async def reset(self):
         return await self.send_command('RESET')
+
+    async def home(self):
+        '''
+        park the actuator mid-stroke so gestures have travel in both directions.
+
+        the firmware assumes fully retracted at power-up and tracks position by
+        integrating drive time. at position 0 a downward move is refused, so slump
+        (Sad, Sleepy) did nothing at all. homing on connect also clears whatever
+        estimate error the previous session accumulated.
+        '''
+        return await self.send_command('HOME')
 
     async def status(self):
         reply = await self.send_command('STATUS')

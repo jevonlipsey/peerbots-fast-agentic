@@ -158,16 +158,27 @@ REPLY_SCHEMA = {
     'strict': True,
     'schema': {
         'type': 'object',
+        # strict mode emits properties in schema order, so this order is the wire
+        # order. speech used to come first, which meant emotion, colour and gaze
+        # all arrived *after* the whole utterance had streamed: the face changed
+        # once lulo had stopped talking, the body gestured late, and every chunk
+        # was synthesized at the initial Neutral rate because current_emotion was
+        # never updated in time. the ~12 tokens this costs before first speech buy
+        # an early face, a live body and a working emotion->speed map.
         'properties': {
-            'speech': {'type': 'string'},
             'emotion': {'type': 'string', 'enum': VALID_EMOTIONS},
             'color': {'type': 'string', 'enum': VALID_COLORS},
             'turn_action': {'type': 'string', 'enum': VALID_TURN_ACTIONS},
+            'speech': {'type': 'string'},
         },
-        'required': ['speech', 'emotion', 'color', 'turn_action'],
+        'required': ['emotion', 'color', 'turn_action', 'speech'],
         'additionalProperties': False,
     },
 }
+
+# opener-avoidance / emotion-dampening hints. off by default: they nudge the model
+# off the study's verbatim dialogue-tree lines (see _build_session_prefix).
+ANTI_REPETITION = os.environ.get('LULO_ANTI_REPETITION', '').lower() in ('1', 'true', 'yes')
 
 _MODEL_NEEDS_REASONING_NONE = _needs_reasoning_none(MODEL)
 _RESPONSE_FORMAT = {
@@ -203,6 +214,40 @@ def get_history():
                 console.print(f'[bold red][[ error parsing history: {e} ]][/]')
                 _IN_MEMORY_HISTORY = []
     return list(_IN_MEMORY_HISTORY)
+
+
+def start_fresh_session():
+    '''
+    begin with an empty conversation, archiving whatever the last run left behind.
+
+    history is loaded from disk at startup and nothing ever cleared it, so a new
+    run inherited the previous session's turns - including anything the microphone
+    happened to overhear in the lab. walking into a demo with bench talk about 12V
+    supplies still in context is not a good opening.
+
+    the old file is moved aside rather than deleted, so a session is still
+    recoverable afterwards.
+
+    inputs:
+    none
+    outputs:
+    archived: path the previous history was moved to, or None
+    '''
+    global _IN_MEMORY_HISTORY
+    _IN_MEMORY_HISTORY = []
+    archived = None
+    try:
+        if os.path.exists(HISTORY_FILE) and os.path.getsize(HISTORY_FILE) > 2:
+            stamp = time.strftime('%Y%m%d-%H%M%S')
+            archived = os.path.join(STATE_DIR, f'history-{stamp}.txt')
+            os.replace(HISTORY_FILE, archived)
+    except Exception:
+        archived = None
+    try:
+        safe_write(HISTORY_FILE, '[]')
+    except Exception:
+        pass
+    return archived
 
 
 def save_history(chat_history):
@@ -555,8 +600,31 @@ def get_session_context():
 
 
 def _build_session_prefix():
+    '''
+    per-turn hint text, or '' when there is nothing to say.
+
+    this used to be prepended to the system prompt and always began with
+    '[session: turn N]'. because that sat in the *leading* bytes of the request,
+    the ~2k-token system prompt and the whole history missed the prompt cache on
+    every single turn. the turn counter told the model nothing it needed, so it is
+    now metrics-only and the remaining hints ride at the tail of the request where
+    they cannot invalidate the stable prefix.
+
+    the opener-avoidance hint also actively fights the study script: it pushes the
+    model off the verbatim dialogue-tree lines, which is how a transcript ends up
+    with "It's okay to feel for me, rehab is really hard work". it is therefore off
+    unless LULO_ANTI_REPETITION is set.
+
+    inputs:
+    none
+    outputs:
+    hint string, '' when there are no hints
+    '''
     global _SESSION_TURN_COUNT
     _SESSION_TURN_COUNT += 1
+
+    if not ANTI_REPETITION:
+        return ''
 
     hints = []
     if _RECENT_OPENERS:
@@ -568,8 +636,9 @@ def _build_session_prefix():
         rep_emotion = _RECENT_EMOTIONS[-1]
         hints.append(f"Emotion dampening: you used '{rep_emotion}' for 3 turns in a row; vary your affect if appropriate")
 
-    hint_text = f" ({'; '.join(hints)})" if hints else ''
-    return f'[session: turn {_SESSION_TURN_COUNT}]{hint_text}\n\n'
+    if not hints:
+        return ''
+    return '; '.join(hints)
 
 
 def _record_turn_metadata(speech, emotion):
@@ -621,15 +690,23 @@ async def stream_peerbots_reply(user_text, tools_list=None, tool_router=None):
     tools_list = tools_list or []
     tool_router = tool_router or {}
     system_prompt = load_system_prompt()
-    session_prefix = _build_session_prefix()
-    system_content = session_prefix + system_prompt
+    session_hint = _build_session_prefix()
     chat_history = get_history()
     chat_history.append({'role': 'user', 'content': user_text})
-    messages = [{'role': 'system', 'content': system_content}] + chat_history
+    # system prompt stays byte-identical turn to turn so it, and everything after
+    # it, stays cacheable. anything volatile goes after the history instead.
+    messages = [{'role': 'system', 'content': system_prompt}] + chat_history
+    if session_hint:
+        messages.append({'role': 'system', 'content': session_hint})
 
     start_t = time.time()
     try:
         iters = 0
+        # monotonic across tool iterations. it used to reset to 0 on each pass, so
+        # a reply that both spoke and called an actuator tool re-emitted chunk 0
+        # and the playback queue logged chunk inversion and replayed audio out of
+        # order. the prompt actively encourages gestures, so this path gets hit.
+        chunk_idx = 0
         while iters < MAX_TOOL_ITERS:
             kwargs = _base_kwargs(messages)
             kwargs['stream'] = True
@@ -644,7 +721,6 @@ async def stream_peerbots_reply(user_text, tools_list=None, tool_router=None):
             t_first_token = None
             t_first_clause = None
             t_face_sent = None
-            chunk_idx = 0
 
             async for chunk in stream:
                 if not chunk.choices:

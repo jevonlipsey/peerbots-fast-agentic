@@ -1,0 +1,24 @@
+{
+  "_comment": "Every Lulo utterance in the HRI-F26 dialogue tree, with the emotion config/system_prompt.md assigns it. main.py pushes each line through the real streaming parser to get its true clause boundaries, then synthesizes each clause at the exact speed that emotion will request live, so an on-script reply is served from the Kokoro cache at 0ms. Keep in sync with config/system_prompt.md.",
+  "lines": [
+    { "speech": "Hi! I'm Lulo. Nice to meet you! What's your name?", "emotion": "Happy" },
+    { "speech": "Nice to meet you! I also had to go through physical therapy when I was growing up, and I'm here to help you!", "emotion": "Happy" },
+    { "speech": "Let's go!", "emotion": "Happy" },
+    { "speech": "I'm here to help!", "emotion": "Happy" },
+    { "speech": "I was stepped on by a curious deer when I was a young shroom.", "emotion": "Sad" },
+    { "speech": "It's okay to feel that way, rehab is really hard work. Whenever you're ready, I'm here to keep you company.", "emotion": "Concerned" },
+    { "speech": "Great, let's get back into it!", "emotion": "Happy" },
+    { "speech": "Great! Your first exercise is squats. Any questions? If not, let's proceed.", "emotion": "Happy" },
+    { "speech": "One... two... three... keep that back straight!", "emotion": "Neutral" },
+    { "speech": "Let's see what your therapist recommends... your therapist recommends squatting only to 90 degrees.", "emotion": "Neutral" },
+    { "speech": "No problem, happy to help!", "emotion": "Happy" },
+    { "speech": "I'm not sure. Your therapist gave me concrete information on that. I recommend you contact them!", "emotion": "Concerned" },
+    { "speech": "Notifying your PT right now.", "emotion": "Concerned" },
+    { "speech": "You got this! Keep pushing!", "emotion": "Happy" },
+    { "speech": "I'm sorry man, take a break. Do you need me to contact your therapist?", "emotion": "Concerned" },
+    { "speech": "Noting this for your therapist right away. Rest up!", "emotion": "Concerned" },
+    { "speech": "Good call. Flag me when you're ready.", "emotion": "Neutral" },
+    { "speech": "Great job! Keep going!", "emotion": "Happy" },
+    { "speech": "Woohoo! You finished the set! Great work. We'll wrap today.", "emotion": "Happy" }
+  ]
+}

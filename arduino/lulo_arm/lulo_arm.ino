@@ -9,6 +9,7 @@
 //   STATUS               -> STATUS {"pos":<0-100>,"dir":"UP|DOWN|STOPPED","gesture":"<name>","busy":0|1}
 //   STOP                 -> stop immediately, cancel any running gesture
 //   RESET                -> assume fully retracted (pos = 0) and stop
+//   HOME                 -> drive to the idle parking position (REST_POS_MS)
 //   SPEED <0-255>        -> set pwm duty for subsequent moves
 //   UP [ms] / DOWN [ms]  -> drive for ms, or continuously when ms is omitted
 //   GESTURE <name>       -> play a canned gesture:
@@ -29,6 +30,21 @@ const int IN2 = 8;
 uint8_t speed = 255;                       // 0-255
 
 const unsigned long STROKE_MS   = 5000;    // time to travel full stroke; set to your actuator's
+
+// the actuator covers its ~10cm stroke in STROKE_MS, so roughly 2cm/s. the
+// original gesture steps drove 170-200ms, which is 3-4mm: invisible from the
+// far side of a room, so "the body reacts to every emotion" was a feature nobody
+// in an audience could see. the steps below are scaled to centimetres instead.
+//
+// every gesture is also net-zero now. startle used to end 6mm higher than it
+// started with nothing ever putting it back, so the estimated position drifted
+// further from the truth with each one until the soft limits fired early.
+//
+// REST_POS_MS parks the actuator mid-stroke rather than fully retracted. slump
+// was previously a no-op: it only drives DOWN, and drive() refuses to go down
+// from 0, which is exactly where the idle position was. Sad and Sleepy therefore
+// did nothing at all.
+const unsigned long REST_POS_MS = 1750;    // idle parking position, ~35% extended
 const unsigned long DEBOUNCE_MS = 30;
 const unsigned long HOLD_MS     = 200;     // press longer than this counts as a hold (not a tap)
 const unsigned long DOUBLE_MS   = 350;     // max gap between tap release and second press
@@ -60,11 +76,11 @@ const Step G_STOP[]    = { {'S', 0, 0} };
 const Step G_REST[]    = { {'S', 0, 0} };
 const Step G_EXTEND[]  = { {'U', STROKE_MS, 0} };
 const Step G_RETRACT[] = { {'D', STROKE_MS, 0} };
-const Step G_NOD[]     = { {'U', 180, 0}, {'D', 180, 0} };
-const Step G_BOUNCE[]  = { {'U', 200, 60}, {'D', 200, 60}, {'U', 200, 60}, {'D', 200, 0} };
-const Step G_STARTLE[] = { {'U', 450, 150}, {'D', 150, 0} };
-const Step G_SLUMP[]   = { {'D', 700, 150}, {'D', 700, 0} };
-const Step G_WAVE[]    = { {'U', 170, 40}, {'D', 170, 40}, {'U', 170, 40}, {'D', 170, 40}, {'U', 170, 40}, {'D', 170, 0} };
+const Step G_NOD[]     = { {'U', 800, 80}, {'D', 800, 0} };
+const Step G_BOUNCE[]  = { {'U', 750, 70}, {'D', 750, 70}, {'U', 750, 70}, {'D', 750, 0} };
+const Step G_STARTLE[] = { {'U', 1200, 250}, {'D', 1200, 0} };
+const Step G_SLUMP[]   = { {'D', 1400, 400}, {'U', 1400, 0} };
+const Step G_WAVE[]    = { {'U', 700, 50}, {'D', 700, 50}, {'U', 700, 50}, {'D', 700, 0} };
 
 const Gesture GESTURES[] = {
   {"stop",    G_STOP,    1},
@@ -75,7 +91,7 @@ const Gesture GESTURES[] = {
   {"bounce",  G_BOUNCE,  4},
   {"startle", G_STARTLE, 2},
   {"slump",   G_SLUMP,   2},
-  {"wave",    G_WAVE,    6},
+  {"wave",    G_WAVE,    4},
 };
 const uint8_t GESTURE_COUNT = sizeof(GESTURES) / sizeof(GESTURES[0]);
 
@@ -217,6 +233,22 @@ void handleCommand(char* line) {
     drive(STOPPED);
     posMs = 0;
     Serial.println(F("OK RESET"));
+  } else if (strcasecmp(line, "HOME") == 0) {
+    // park mid-stroke so gestures have travel in both directions. without this
+    // the idle position is 0, where drive(DOWN) refuses to move and slump is a
+    // no-op. issued on connect, so a session always starts from a known pose.
+    cancelGesture();
+    if (posMs < REST_POS_MS) {
+      drive(UP);
+      moveEndMs = millis() + (REST_POS_MS - posMs);
+    } else if (posMs > REST_POS_MS) {
+      drive(DOWN);
+      moveEndMs = millis() + (posMs - REST_POS_MS);
+    } else {
+      drive(STOPPED);
+      moveEndMs = 0;
+    }
+    Serial.println(F("OK HOME"));
   } else if (strcasecmp(line, "SPEED") == 0) {
     if (arg) {
       long v = atol(arg);
