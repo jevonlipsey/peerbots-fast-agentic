@@ -261,3 +261,151 @@ def test_rich_labels_are_escaped():
         '[dim white]\\[\\[stt]]: visible[/]'
     )
     assert '[[stt]]: visible' in buf.getvalue()
+
+
+# -------------------------------------------------------------------- barge-in
+
+def test_barge_in_cuts_playback_and_keeps_the_audio(monkeypatch, tmp_path):
+    '''
+    the pipeline awaited the playback queue with nothing reading the microphone,
+    so the patient could not interrupt at all, and the one-shot flush afterwards
+    discarded anything that arrived late. a barge-in must stop the audio and must
+    NOT flush, or it throws away the words that caused it.
+    '''
+    import main
+
+    cut = {'interrupted': False}
+
+    class FakeQueue:
+        def reset_turn(self):
+            pass
+
+        async def enqueue(self, audio, chunk_idx=None):
+            pass
+
+        async def wait_complete(self):
+            # stands in for a long reply still playing out
+            await asyncio.sleep(5)
+
+        async def interrupt(self):
+            cut['interrupted'] = True
+
+    async def fake_stream(user_text, tools_list, tool_router):
+        yield {'type': 'face', 'emotion': 'Happy', 'color': 'Blue'}
+        yield {'type': 'sentence', 'text': 'One, two, three, keep that back straight!', 'idx': 0}
+        yield {'type': 'final', 'reply': {
+            'speech': 'One, two, three, keep that back straight!', 'emotion': 'Happy',
+            'color': 'Blue', 'turn_action': 'lulo maintains gaze'}, 'metrics': {}}
+
+    monkeypatch.setattr(main, 'stream_peerbots_reply', fake_stream)
+    monkeypatch.setattr(main, 'synthesize_speech', lambda *a, **k: _done(b'RIFFfake'))
+    monkeypatch.setattr(main, 'fire_peerbots_update', lambda *a, **k: None)
+    monkeypatch.setattr(main, '_PLAYBACK_QUEUE', FakeQueue())
+    monkeypatch.setattr(main, '_USE_DROID', True)
+    monkeypatch.setattr(main, '_ARM', None)
+    # the watcher reports the user talking over her
+    monkeypatch.setattr(main, 'watch_for_barge_in', lambda source, stop, **k: True)
+    monkeypatch.setattr(main.turn_metrics, 'TURNS_FILE', str(tmp_path / 'turns.jsonl'))
+    monkeypatch.setattr(main.turn_metrics, 'STATE_DIR', str(tmp_path))
+
+    was_interrupted = asyncio.run(
+        main.handle_turn('wait stop', [], {}, mic_source=object())
+    )
+
+    assert was_interrupted is True, 'handle_turn must tell the loop not to flush'
+    assert cut['interrupted'], 'playback must actually be cut'
+    record = json.loads(open(tmp_path / 'turns.jsonl').read().strip())
+    assert record['interrupted'] is True
+
+
+def test_no_barge_in_without_a_source(monkeypatch, tmp_path):
+    '''text mode and the tablet sink have no stream to watch, and must still work'''
+    import main
+
+    class FakeQueue:
+        def reset_turn(self):
+            pass
+
+        async def enqueue(self, audio, chunk_idx=None):
+            pass
+
+        async def wait_complete(self):
+            pass
+
+        async def interrupt(self):
+            raise AssertionError('must not interrupt when there is nothing listening')
+
+    async def fake_stream(user_text, tools_list, tool_router):
+        yield {'type': 'face', 'emotion': 'Happy', 'color': 'Green'}
+        yield {'type': 'sentence', 'text': "Let's go!", 'idx': 0}
+        yield {'type': 'final', 'reply': {
+            'speech': "Let's go!", 'emotion': 'Happy', 'color': 'Green',
+            'turn_action': 'lulo turns to user'}, 'metrics': {}}
+
+    monkeypatch.setattr(main, 'stream_peerbots_reply', fake_stream)
+    monkeypatch.setattr(main, 'synthesize_speech', lambda *a, **k: _done(b'RIFFfake'))
+    monkeypatch.setattr(main, 'fire_peerbots_update', lambda *a, **k: None)
+    monkeypatch.setattr(main, '_PLAYBACK_QUEUE', FakeQueue())
+    monkeypatch.setattr(main, '_USE_DROID', True)
+    monkeypatch.setattr(main, '_ARM', None)
+    monkeypatch.setattr(main.turn_metrics, 'TURNS_FILE', str(tmp_path / 'turns.jsonl'))
+    monkeypatch.setattr(main.turn_metrics, 'STATE_DIR', str(tmp_path))
+
+    assert asyncio.run(main.handle_turn('hello', [], {}, mic_source=None)) is False
+
+
+def _done(value):
+    '''a already-completed awaitable, for stubbing async helpers'''
+    fut = asyncio.Future()
+    fut.set_result(value)
+    return fut
+
+
+def test_every_sink_can_be_interrupted():
+    '''
+    barge-in is only honest if the sink in use can actually stop. the phone sink
+    is the demo path and is the strongest case, because the browser owns the audio
+    nodes and can cut a clip mid-word.
+    '''
+    from scripts.droid_client import DroidPlaybackQueue
+    from scripts.local_playback import LocalPlaybackQueue
+    from scripts.phone_playback import PhoneSpeakerQueue
+
+    for cls in (DroidPlaybackQueue, LocalPlaybackQueue, PhoneSpeakerQueue):
+        assert hasattr(cls, 'interrupt'), f'{cls.__name__} cannot be interrupted'
+        assert asyncio.iscoroutinefunction(cls.interrupt)
+
+
+# ------------------------------------------------------------- smart endpointing
+
+def test_probe_window_is_far_below_the_cap():
+    '''
+    the fixed 1.0s window was the largest single item in the latency budget. it
+    survives only as a hard cap; the probe is what normally decides.
+    '''
+    from scripts import whisper_stt
+
+    assert whisper_stt.SMART_TURN_PROBE_S <= 0.3
+    assert whisper_stt.SMART_TURN_PROBE_S < whisper_stt.DEFAULT_VAD_SILENCE_S
+    # one 32ms frame used to be enough to open a turn, so a cough did it
+    assert whisper_stt.MIN_SPEECH_FRAMES >= 3
+
+
+def test_barge_in_bar_is_higher_than_onset():
+    '''a false barge-in cuts lulo off mid-word, which is worse than none at all'''
+    from scripts import whisper_stt
+
+    assert whisper_stt.BARGE_IN_THRESHOLD > whisper_stt.DEFAULT_VAD_SPEECH_THRESHOLD
+    assert whisper_stt.BARGE_IN_FRAMES >= whisper_stt.MIN_SPEECH_FRAMES
+
+
+def test_smart_turn_contract():
+    '''8s window at 16kHz, speech flush to the end, >0.5 means complete'''
+    from scripts import smart_turn
+
+    assert smart_turn.WINDOW_SAMPLES == 128000
+    assert smart_turn.SAMPLE_RATE == 16000
+    assert smart_turn.TURN_COMPLETE_THRESHOLD == pytest.approx(0.5)
+    # absent weights must degrade to the fixed window, never raise
+    if not smart_turn.model_available():
+        assert smart_turn.turn_complete_probability([0.0] * 1000) is None

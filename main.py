@@ -13,6 +13,7 @@ import asyncio
 import os
 import signal
 import sys
+import threading
 import time
 
 import speech_recognition as sr
@@ -24,6 +25,7 @@ import smart_turn
 from whisper_stt import (
     IS_MAC,
     listen_once,
+    watch_for_barge_in,
     start_swift_worker,
     get_vad_model,
     prewarm_whisper,
@@ -306,7 +308,58 @@ async def _delayed_think(delay):
         console.print(f"[dim yellow][[ thinking mask failed: {e} ]][/]")
 
 
-async def handle_turn(user_text, tools_list, tool_router):
+async def _play_or_be_interrupted(mic_source):
+    '''
+    wait out lulo's audio, but let the user cut in.
+
+    the pipeline was strictly half-duplex: handle_turn awaited the playback queue
+    and nothing read the microphone until it drained, so the patient could not
+    interrupt at all. the one-shot input flush afterwards also meant anything
+    arriving late was read as the next user turn.
+
+    this is safe because the main listen loop is parked here, so the watcher is
+    the only reader on the stream while it runs.
+
+    inputs:
+    mic_source: the live audio source, or None to just wait
+    outputs:
+    True when the user spoke over lulo and playback was cut
+    '''
+    playback = asyncio.create_task(_PLAYBACK_QUEUE.wait_complete())
+    if mic_source is None or not hasattr(_PLAYBACK_QUEUE, "interrupt"):
+        await playback
+        return False
+
+    stop_flag = threading.Event()
+    watcher = asyncio.create_task(
+        asyncio.to_thread(watch_for_barge_in, mic_source, stop_flag)
+    )
+    try:
+        done, _pending = await asyncio.wait(
+            [playback, watcher], return_when=asyncio.FIRST_COMPLETED
+        )
+        if watcher in done and not playback.done() and watcher.result():
+            console.print("  [bold yellow]-> [barge-in] user spoke, stopping audio[/]")
+            await _PLAYBACK_QUEUE.interrupt()
+            playback.cancel()
+            try:
+                await playback
+            except (asyncio.CancelledError, Exception):
+                pass
+            return True
+        await playback
+        return False
+    finally:
+        stop_flag.set()
+        if not watcher.done():
+            watcher.cancel()
+        try:
+            await watcher
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+async def handle_turn(user_text, tools_list, tool_router, mic_source=None):
     # streaming turn: early emotion -> peerbots face, sentence -> kokoro -> droid queue
     global _USE_DROID, _PLAYBACK_QUEUE
     console.print(f"\n[bold cyan][[USER]]:[/] {user_text}")
@@ -440,9 +493,10 @@ async def handle_turn(user_text, tools_list, tool_router):
     if tts_tasks:
         await asyncio.gather(*tts_tasks, return_exceptions=True)
 
+    interrupted = False
     if _USE_DROID and _PLAYBACK_QUEUE and spoken_sentences:
-        # wait for droid audio queue to finish playing completely before re-opening mic
-        await _PLAYBACK_QUEUE.wait_complete()
+        # stay listening while she talks, so she can be interrupted
+        interrupted = await _play_or_be_interrupted(mic_source)
     elif not _USE_DROID and final_reply:
         # fallback: tablet tts handles speech and face together
         try:
@@ -481,12 +535,17 @@ async def handle_turn(user_text, tools_list, tool_router):
     timer.set("color", color_disp)
     timer.set("turn_action", turn_action_disp)
     timer.set("chunks", len(spoken_sentences))
+    timer.set("interrupted", interrupted)
     record = timer.write()
 
     console.print(
         f"  [bright_yellow]-> [Metrics] {turn_metrics.format_console(record)}"
         f" | {emotion_disp} / {color_disp} | Gaze: {turn_action_disp}[/]"
     )
+    if interrupted:
+        console.print(
+            "  [dim yellow]   (interrupted - keeping buffered audio for the next turn)[/]"
+        )
     if first_audio_time:
         # kept alongside the real span so the old figure stays comparable
         console.print(
@@ -495,6 +554,7 @@ async def handle_turn(user_text, tools_list, tool_router):
             f" | TTFT {metrics.get('ttft_ms', 0)}ms | TTS1 {tts1_ms}ms"
             f" | Total {total_turn_s:.2f}s[/]"
         )
+    return interrupted
 
 
 def list_mics():
@@ -744,20 +804,25 @@ async def mic_loop(
                     )
                     swift_proc = None
             if text:
-                await handle_turn(text, tools_list, tool_router)
-                # discard buffered audio frames recorded during robot speaking to avoid echo loops
-                try:
-                    # source.stream is a MicrophoneStream wrapper; the raw pyaudio
-                    # stream lives one level down and is what exposes read-available
-                    raw_stream = getattr(
-                        getattr(source, "stream", None), "pyaudio_stream", None
-                    )
-                    if raw_stream is not None:
-                        available = raw_stream.get_read_available()
-                        if available > 0:
-                            raw_stream.read(available, exception_on_overflow=False)
-                except Exception:
-                    pass
+                was_interrupted = await handle_turn(
+                    text, tools_list, tool_router, mic_source=source
+                )
+                # flushing after a barge-in would throw away the words the user is
+                # in the middle of saying, which is the whole point of barge-in
+                if not was_interrupted:
+                    try:
+                        # source.stream is a MicrophoneStream wrapper; the raw
+                        # pyaudio stream lives one level down and is what exposes
+                        # read-available
+                        raw_stream = getattr(
+                            getattr(source, "stream", None), "pyaudio_stream", None
+                        )
+                        if raw_stream is not None:
+                            available = raw_stream.get_read_available()
+                            if available > 0:
+                                raw_stream.read(available, exception_on_overflow=False)
+                    except Exception:
+                        pass
                 console.print("\n[bold dark_orange][[LISTENING]][/]")
 
 
@@ -852,13 +917,17 @@ async def phone_mic_loop(
                     )
                     swift_proc = None
             if text:
-                await handle_turn(text, tools_list, tool_router)
-                # clear audio queue of any audio recorded during robot speech
-                while not server.audio_queue.empty():
-                    try:
-                        server.audio_queue.get_nowait()
-                    except Exception:
-                        break
+                was_interrupted = await handle_turn(
+                    text, tools_list, tool_router, mic_source=source
+                )
+                # after a barge-in the queue holds the user's live speech, so
+                # draining it would discard the interruption itself
+                if not was_interrupted:
+                    while not server.audio_queue.empty():
+                        try:
+                            server.audio_queue.get_nowait()
+                        except Exception:
+                            break
                 console.print("\n[bold dark_orange][[LISTENING (PHONE MIC)]][/]")
     finally:
         await server.stop()

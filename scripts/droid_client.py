@@ -193,6 +193,7 @@ class DroidPlaybackQueue:
         self.expected_idx = 0
         self.playback_end_time = 0.0
         self.last_upload_time = 0.12
+        self.interrupted = False
 
     def ensure_worker(self):
         """ensures background worker is running without coroutine overhead"""
@@ -203,7 +204,32 @@ class DroidPlaybackQueue:
         """resets expected chunk index and playback timing for a new conversational turn"""
         self.expected_idx = 0
         self.playback_end_time = 0.0
+        self.interrupted = False
         self.ensure_worker()
+
+    async def interrupt(self):
+        """
+        barge-in: stop sending this turn's audio and ask the daemon to go quiet.
+
+        unlike the phone sink, where the browser owns the audio nodes and can cut
+        a clip mid-word, this depends on the daemon implementing /stop. draining
+        the queue is the part that always works, so the rest of the turn is never
+        sent even if the current chunk plays out.
+        """
+        self.interrupted = True
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+                self.queue.task_done()
+            except Exception:
+                break
+        try:
+            client = get_async_client()
+            await client.post(f'{DROID_URL}/stop', timeout=1.0)
+        except Exception:
+            pass
+        self.is_playing = False
+        self.playback_end_time = 0.0
 
     async def start(self):
         """starts background worker if not already running"""
@@ -254,6 +280,10 @@ class DroidPlaybackQueue:
         """background loop sending chunks sequentially with duration pacing"""
         while True:
             audio_bytes, duration_s, chunk_idx = await self.queue.get()
+            if self.interrupted:
+                # the turn was cut while this chunk waited in the queue
+                self.queue.task_done()
+                continue
             self.is_playing = True
             try:
                 t0 = time.perf_counter()

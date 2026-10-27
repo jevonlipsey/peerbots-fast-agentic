@@ -609,6 +609,75 @@ def listen_audio_silero(
     return sr.AudioData(b''.join(spoken_frames), sample_rate, sample_width)
 
 
+# barge-in needs a higher bar than normal onset. echo cancellation on the handset
+# is good but not perfect, and a false trigger cuts lulo off mid-word for nothing,
+# which reads worse than not supporting interruption at all.
+BARGE_IN_THRESHOLD = float(os.environ.get('BARGE_IN_THRESHOLD', '0.80'))
+BARGE_IN_FRAMES = int(os.environ.get('BARGE_IN_FRAMES', '7'))  # ~224ms sustained
+
+
+def watch_for_barge_in(source, stop_event, threshold=None, frames_needed=None):
+    '''
+    listen while lulo is speaking and report if the user starts talking over her.
+
+    the pipeline was strictly half-duplex: nothing read the microphone during tts,
+    and the only echo protection was flushing the input buffer afterwards. the
+    patient physically could not interrupt, which is the single thing that most
+    made the interaction feel like a kiosk rather than a conversation.
+
+    this is safe to run concurrently with playback only because the main listen
+    loop is parked while it runs, so there is exactly one reader on the stream.
+
+    inputs:
+    source: the same audio source the listen loop uses
+    stop_event: threading.Event; set it to stand the watcher down
+    threshold: vad probability a frame must clear (default BARGE_IN_THRESHOLD)
+    frames_needed: consecutive frames required (default BARGE_IN_FRAMES)
+    outputs:
+    True when the user spoke over lulo, False when stopped or unavailable
+    '''
+    vad_model = get_vad_model()
+    stream = getattr(source, 'stream', None)
+    if vad_model is None or stream is None:
+        return False
+
+    threshold = BARGE_IN_THRESHOLD if threshold is None else threshold
+    frames_needed = BARGE_IN_FRAMES if frames_needed is None else frames_needed
+
+    np, torch = _get_stt_math()
+    vad_model.reset_states()
+    float_buf = np.empty(512, dtype=np.float32)
+    inv_scale = np.float32(1.0 / 32768.0)
+    audio_float = torch.from_numpy(float_buf)
+
+    raw_buffer = bytearray()
+    hits = 0
+    try:
+        while not stop_event.is_set():
+            chunk = stream.read(512)
+            if not chunk:
+                # a short read here means the sink went quiet, not that the user
+                # spoke, so stand down rather than guessing
+                return False
+            raw_buffer.extend(chunk)
+            while len(raw_buffer) >= 1024:
+                if stop_event.is_set():
+                    return False
+                frame_bytes = bytes(raw_buffer[:1024])
+                del raw_buffer[:1024]
+                audio_int16 = np.frombuffer(frame_bytes, dtype=np.int16)
+                np.multiply(audio_int16, inv_scale, out=float_buf)
+                if vad_model(audio_float, 16000).item() >= threshold:
+                    hits += 1
+                    if hits >= frames_needed:
+                        return True
+                else:
+                    hits = 0
+    except Exception:
+        return False
+    return False
+
+
 def listen_once(
     recognizer,
     source,
