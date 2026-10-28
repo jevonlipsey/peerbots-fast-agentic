@@ -287,6 +287,63 @@ notes
 
 ---
 
+## stage 5 — before a demo
+
+Two one-off downloads/builds, then a check. Do these the day before, not on the day.
+
+### fetch the endpointer model
+
+```bash
+python scripts/smart_turn.py --download
+```
+
+~11MB into `models/` (gitignored). This is what decides when you have finished
+talking. Without it endpointing falls back to a fixed 1.0s silence window, which
+works but is the single slowest thing in the pipeline.
+
+### build the CoreML speech-to-text worker (macOS)
+
+```bash
+cd stt-coreml/stt_worker && swift build -c release
+```
+
+Takes ~2 minutes once. If you skip it, the first launch runs `swift run -c release`
+instead and can sit there for up to 300 seconds compiling while you are standing
+in front of people.
+
+### run the check
+
+```bash
+python main.py --preflight --phone-mic
+```
+
+Every subsystem, green or not:
+
+```
+  PASS  credentials            3 keys present
+  PASS  coreml stt worker      release binary present
+  PASS  semantic endpointer    smart-turn-v3.2-int8.onnx (10.6MB)
+  PASS  openai                 api reachable, connection pool warm
+  WARN  kokoro tts             not running (auto-launched at startup)
+```
+
+`FAIL` blocks the demo. `WARN` is a quiet fallback — the pipeline will still run,
+just slower or less capable, which is exactly the kind of thing that is invisible
+until it is on camera. Add `--no-arduino` if you are running without the body.
+
+### on the day
+
+- Sessions start fresh: the previous conversation is archived to
+  `state/history-<timestamp>.txt` rather than carried over. Pass `--keep-history`
+  if you actually want continuity. (Before this, Lulo inherited whatever the mic
+  had overheard in the lab last time.)
+- The phone page has a **Listening / Muted** toggle, bottom right. Tap it if Lulo
+  starts answering the audience instead of the patient. The level meter keeps
+  running while muted so you can still see the mic is alive.
+- You can interrupt her. Talk over her and she stops.
+- Each turn appends timings to `state/turns.jsonl`. Check it afterwards rather
+  than trusting a stopwatch.
+
 ## do not run these
 
 `setup/setup.sh` and `setup/setup.bat` are leftovers from the earlier nao

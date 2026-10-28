@@ -37,6 +37,8 @@ class LocalPlaybackQueue:
         self.expected_idx = 0
         self._tmpdir = tempfile.mkdtemp(prefix='lulo_tts_')
         self._clip_id = 0
+        self.interrupted = False
+        self._proc = None
 
     def ensure_worker(self):
         if self.worker_task is None or self.worker_task.done():
@@ -44,12 +46,32 @@ class LocalPlaybackQueue:
 
     def reset_turn(self):
         self.expected_idx = 0
+        self.interrupted = False
         self.ensure_worker()
+
+    async def interrupt(self):
+        '''barge-in: drop queued clips and kill the one afplay is holding'''
+        self.interrupted = True
+        while not self.queue.empty():
+            try:
+                self.queue.get_nowait()
+                self.queue.task_done()
+            except Exception:
+                break
+        proc = getattr(self, '_proc', None)
+        if proc is not None and proc.returncode is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        self.is_playing = False
 
     async def start(self):
         self.ensure_worker()
 
     async def enqueue(self, audio_bytes, duration_s=None, chunk_idx=None):
+        if self.interrupted:
+            return
         if chunk_idx is not None:
             if chunk_idx != self.expected_idx:
                 console.print(
@@ -69,6 +91,10 @@ class LocalPlaybackQueue:
     async def _worker(self):
         while True:
             audio_bytes, chunk_idx = await self.queue.get()
+            if self.interrupted:
+                # the turn was cut while this clip waited in the queue
+                self.queue.task_done()
+                continue
             self.is_playing = True
             try:
                 self._clip_id += 1
@@ -81,6 +107,8 @@ class LocalPlaybackQueue:
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
                 )
+                # held so barge-in can kill the clip that is sounding right now
+                self._proc = proc
                 await proc.wait()
             except asyncio.CancelledError:
                 self.is_playing = False
@@ -88,6 +116,7 @@ class LocalPlaybackQueue:
             except Exception as e:
                 console.print(f'[dim yellow][[ local playback failed: {e} ]][/]')
             finally:
+                self._proc = None
                 self.is_playing = False
                 self.queue.task_done()
 

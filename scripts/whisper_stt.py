@@ -20,6 +20,9 @@ import threading
 import time
 
 import speech_recognition as sr
+
+import smart_turn
+import turn_metrics
 from rich.console import Console
 
 console = Console()
@@ -43,6 +46,24 @@ DEFAULT_VAD_SILENCE_S = float(os.environ.get('VAD_SILENCE_DURATION_S', '1.0'))
 DEFAULT_NON_SPEAKING_S = float(os.environ.get('VAD_NON_SPEAKING_S', '0.25'))
 DEFAULT_VAD_SPEECH_THRESHOLD = float(os.environ.get('VAD_SPEECH_THRESHOLD', '0.60'))
 
+# consecutive frames above threshold before an utterance is declared started. one
+# 32ms frame was enough, so a cough, a clap or a chair scrape opened a whole turn
+# and cost a silence window plus an stt round trip on junk.
+MIN_SPEECH_FRAMES = int(os.environ.get('VAD_MIN_SPEECH_FRAMES', '4'))
+
+# how many pre-speech frames to watch before trusting a measured noise floor, and
+# the headroom to leave above it.
+NOISE_FLOOR_MIN_FRAMES = 15
+NOISE_FLOOR_SILENCE_MARGIN = 0.10
+NOISE_FLOOR_SPEECH_MARGIN = 0.25
+
+# with semantic endpointing the silence window stops being the decision and
+# becomes the trigger to ask the question. a complete turn ends after this long;
+# an incomplete one keeps waiting, up to the caller's window as a hard cap.
+SMART_TURN_PROBE_S = float(os.environ.get('SMART_TURN_PROBE_S', '0.20'))
+# don't re-run inference every frame while someone is mid-thought
+SMART_TURN_REPROBE_S = float(os.environ.get('SMART_TURN_REPROBE_S', '0.20'))
+
 IS_MAC = platform.system() == 'Darwin'
 _SWIFT_TMP_WAV = os.path.join(tempfile.gettempdir(), f'lulo_stt_{os.getpid()}.wav')
 
@@ -57,17 +78,20 @@ def _cleanup_tmp_wav():
 
 atexit.register(_cleanup_tmp_wav)
 
-### short murmurs + whisper hallucinations to ignore
+### whisper caption junk and non-lexical mic breathing to ignore.
+###
+### this list used to also hold 'okay', 'ok', 'yeah', 'yep', 'sure', 'so', 'you',
+### 'well', 'now', 'the', 'and', 'i', 'it', 'a', 'to'. those are not hallucinations,
+### they are answers: the hri dialogue tree scripts 'cool lets do it',
+### 'thanks lulo!', 'okay, call them' and 'ok, i guess i'm ready', so four scripted
+### user turns were being discarded before the model ever saw them and lulo simply
+### said nothing. only genuine caption artefacts and non-lexical murmurs stay.
 HALLUCINATIONS = [
-    '...', 'you', 'now', 'mm-hmm', 'mmhmm', 'mhm', 'uh', 'uhh', 'um', 'umm',
-    'okay', 'ok', 'yeah', 'yep', 'sure', 'so',
-    'the', 'and', 'on', 'in', 'well', 'i', 'it', 'a', 'to',
+    '...', 'mm-hmm', 'mmhmm', 'mhm', 'hmm', 'uh', 'uhh', 'um', 'umm',
     'thanks for watching', 'thank you for watching', 'subtitles by',
     'sh hotel', 'la latker',
 ]
-_HALLUCINATIONS_SET = {h.strip('.!?,') for h in HALLUCINATIONS} | {
-    'the', 'and', 'on', 'in', 'well', 'a', 'an', 'to'
-}
+_HALLUCINATIONS_SET = {h.strip('.!?,') for h in HALLUCINATIONS}
 
 
 ### util
@@ -76,7 +100,11 @@ def is_hallucination(text):
     if not text:
         return True
     normalized = text.lower().strip().strip('.!?,')
-    if len(normalized) <= 1:
+    if not normalized:
+        return True
+    # a single character only counts as junk when it is not a word. 'a' and 'i'
+    # are short but real, and dropping them silently loses a turn.
+    if len(normalized) <= 1 and not normalized.isalpha():
         return True
     return normalized in _HALLUCINATIONS_SET
 
@@ -286,37 +314,29 @@ def transcribe_audio(recognizer, audio, swift_proc=None):
     return '', swift_proc
 
 
+### words that really do mean "i am mid-thought, wait for me".
+###
+### 'you', 'the', 'to', 'my', 'i', "i'm", 'for', 'is', 'are', 'was' and 'just' used
+### to be in here, which made 'thank you', 'nice to meet you', 'my knee is
+### throbbing' and "i'm ready" each buy an extra 1.5s of dead air - and those are
+### verbatim lines from the study's dialogue tree. only genuine hanging
+### conjunctions and fillers are left.
 CONTINUATION_CUES = {
     'and',
     'but',
     'or',
     'so',
     'because',
-    'like',
     'um',
     'uh',
     'uhh',
     'umm',
     'then',
     'if',
-    'with',
     'when',
-    'well',
     'wait',
     'also',
     'though',
-    'maybe',
-    'i',
-    "i'm",
-    'my',
-    'the',
-    'to',
-    'for',
-    'you',
-    'is',
-    'are',
-    'was',
-    'just',
 }
 
 
@@ -370,6 +390,7 @@ def listen_audio_silero(
     non_speaking_duration_s=DEFAULT_NON_SPEAKING_S,
     speech_threshold=DEFAULT_VAD_SPEECH_THRESHOLD,
     nod_callback=None,
+    use_smart_turn=True,
 ):
     '''
     captures one utterance using neural silero-vad for forgiving endpointing.
@@ -378,10 +399,14 @@ def listen_audio_silero(
     source: open speech_recognition audio source (e.g. Microphone)
     timeout: max seconds to wait for speech to start
     phrase_time_limit: max speech duration (default 90s)
-    min_silence_duration_s: silence duration to trigger endpoint (default 2.0s)
-    non_speaking_duration_s: pre/post padding silence duration (default 0.30s)
-    speech_threshold: vad speech probability threshold (default 0.45)
+    min_silence_duration_s: silence duration to trigger endpoint (default 1.0s)
+    non_speaking_duration_s: pre/post padding silence duration (default 0.25s)
+    speech_threshold: vad onset probability floor (default 0.60); the effective
+        onset and silence thresholds float above the measured room noise floor
     nod_callback: callable(seconds) triggered at 10s, 25s, 45s of continuous speech
+    use_smart_turn: consult the semantic end-of-turn model, so min_silence_duration_s
+        acts as a hard cap rather than the decision. falls back to the fixed window
+        when the model is unavailable.
     outputs:
     AudioData instance
     '''
@@ -402,9 +427,29 @@ def listen_audio_silero(
     spoken_frames = []
     speaking_started = False
     silence_counter = 0
+    onset_counter = 0
     speech_start_time = None
     start_time = time.time()
     nodded = {10: False, 25: False, 45: False}
+    limit_reached = False
+
+    # a crowded room scores well above zero on every frame, so a fixed silence
+    # threshold of speech_threshold-0.15 can sit *below* the ambient level. the
+    # counter then resets on room noise and the utterance never endpoints at all.
+    # both thresholds therefore float on a measured floor instead.
+    ambient_probs = collections.deque(maxlen=40)
+    silence_threshold = speech_threshold - 0.15
+    effective_speech_threshold = speech_threshold
+    measured_floor = None
+
+    # semantic endpointing: probe early, and only fall back to the full window
+    # when the model says the speaker is not finished
+    smart_enabled = use_smart_turn and smart_turn.get_session() is not None
+    probe_frames = max(1, int(round(SMART_TURN_PROBE_S / frame_duration_s)))
+    reprobe_frames = max(1, int(round(SMART_TURN_REPROBE_S / frame_duration_s)))
+    next_probe_at = probe_frames
+    smart_prob = None
+    smart_frames = smart_turn.WINDOW_SAMPLES // 512
 
     float_buf = np.empty(512, dtype=np.float32)
     inv_scale = np.float32(1.0 / 32768.0)
@@ -434,23 +479,45 @@ def listen_audio_silero(
 
             prob = vad_model(audio_float, 16000).item()
 
-            # speech onset is otherwise invisible, which makes a stalled vad
-            # indistinguishable from a dead microphone
-            if not speaking_started and prob >= speech_threshold:
-                console.print(
-                    f'[bold dark_orange][[VAD]] speech detected (p={prob:.2f})[/]'
-                )
-
             if not speaking_started:
                 if timeout is not None and (time.time() - start_time) > timeout:
                     raise sr.WaitTimeoutError('listening timed out waiting for speech')
                 pre_speech_frames.append(frame_bytes)
-                if prob >= speech_threshold:
-                    speaking_started = True
-                    speech_start_time = time.time()
-                    spoken_frames.extend(pre_speech_frames)
-                    spoken_frames.append(frame_bytes)
-                    silence_counter = 0
+
+                # only quiet frames describe the room, so a frame that looks like
+                # speech must not be folded into the floor estimate
+                if prob < speech_threshold:
+                    ambient_probs.append(prob)
+                    if len(ambient_probs) >= NOISE_FLOOR_MIN_FRAMES:
+                        ranked = sorted(ambient_probs)
+                        floor = ranked[int(0.9 * (len(ranked) - 1))]
+                        measured_floor = floor
+                        # keep silence strictly under the onset threshold, or
+                        # nothing would ever count as the end of a phrase
+                        silence_threshold = min(
+                            speech_threshold - 0.02,
+                            max(speech_threshold - 0.15, floor + NOISE_FLOOR_SILENCE_MARGIN),
+                        )
+                        effective_speech_threshold = max(
+                            speech_threshold, floor + NOISE_FLOOR_SPEECH_MARGIN
+                        )
+
+                if prob >= effective_speech_threshold:
+                    onset_counter += 1
+                    if onset_counter >= MIN_SPEECH_FRAMES:
+                        # speech onset is otherwise invisible, which makes a
+                        # stalled vad indistinguishable from a dead microphone
+                        console.print(
+                            f'[bold dark_orange][[VAD]] speech detected '
+                            f'(p={prob:.2f} onset>={effective_speech_threshold:.2f} '
+                            f'silence<{silence_threshold:.2f})[/]'
+                        )
+                        speaking_started = True
+                        speech_start_time = time.time()
+                        spoken_frames.extend(pre_speech_frames)
+                        silence_counter = 0
+                else:
+                    onset_counter = 0
             else:
                 spoken_frames.append(frame_bytes)
                 speech_elapsed = time.time() - speech_start_time
@@ -465,15 +532,74 @@ def listen_audio_silero(
                                 pass
 
                 if phrase_time_limit and speech_elapsed > phrase_time_limit:
+                    # this used to break the inner loop before the silence counter
+                    # was touched, while the outer exit only tested that counter.
+                    # past the limit it stayed frozen below the threshold, so
+                    # capture ran on until the stream closed - a hard hang.
+                    limit_reached = True
+                    endpoint_at = time.monotonic()
+                    turn_metrics.note_capture(
+                        speech_end=endpoint_at,
+                        endpoint_at=endpoint_at,
+                        silence_window_s=min_silence_duration_s,
+                        noise_floor=measured_floor,
+                    )
                     break
 
-                if prob < (speech_threshold - 0.15):
+                if prob < silence_threshold:
                     silence_counter += 1
+
+                    if (
+                        smart_enabled
+                        and silence_counter >= next_probe_at
+                        and silence_counter < silence_frames_needed
+                    ):
+                        next_probe_at = silence_counter + reprobe_frames
+                        # the model wants the whole current turn, most recent last
+                        tail = b''.join(spoken_frames[-smart_frames:])
+                        samples = np.frombuffer(tail, dtype=np.int16).astype(
+                            np.float32
+                        ) * inv_scale
+                        complete, smart_prob = smart_turn.is_turn_complete(samples)
+                        if complete:
+                            endpoint_at = time.monotonic()
+                            console.print(
+                                f'[dim white]\\[\\[smart-turn]]: turn complete '
+                                f'(p={smart_prob:.2f}) after '
+                                f'{silence_counter * frame_duration_s:.2f}s silence[/]'
+                            )
+                            turn_metrics.note_capture(
+                                speech_end=endpoint_at
+                                - (silence_counter * frame_duration_s),
+                                endpoint_at=endpoint_at,
+                                silence_window_s=silence_counter * frame_duration_s,
+                                noise_floor=measured_floor,
+                            )
+                            silence_counter = silence_frames_needed
+                            break
+
                     if silence_counter >= silence_frames_needed:
+                        # the span a person actually waits through starts at the
+                        # last frame that was still speech, not here
+                        endpoint_at = time.monotonic()
+                        if smart_enabled and smart_prob is not None:
+                            console.print(
+                                f'[dim white]\\[\\[smart-turn]]: window cap reached '
+                                f'(last p={smart_prob:.2f})[/]'
+                            )
+                        turn_metrics.note_capture(
+                            speech_end=endpoint_at - (silence_counter * frame_duration_s),
+                            endpoint_at=endpoint_at,
+                            silence_window_s=min_silence_duration_s,
+                            noise_floor=measured_floor,
+                        )
                         break
                 else:
                     silence_counter = 0
+                    next_probe_at = probe_frames
 
+        if limit_reached:
+            break
         if speaking_started and silence_counter >= silence_frames_needed:
             break
 
@@ -481,6 +607,82 @@ def listen_audio_silero(
         return sr.AudioData(b'', sample_rate, sample_width)
 
     return sr.AudioData(b''.join(spoken_frames), sample_rate, sample_width)
+
+
+# barge-in needs a higher bar than normal onset. echo cancellation on the handset
+# is good but not perfect, and a false trigger cuts lulo off mid-word for nothing,
+# which reads worse than not supporting interruption at all.
+# a false cut is far worse than a missed one: lulo going silent because someone
+# shifted a chair reads as broken, while having to say a word twice to interrupt
+# her reads as normal. 0.80 / 7 frames (~224ms) let room noise stop her mid-word,
+# so both are deliberately well clear of ordinary clatter. frames must be
+# CONSECUTIVE -- any frame under threshold resets the count -- and a cough or a
+# door simply cannot hold a vad probability this high for this long. real speech
+# can, and does, within about half a second.
+BARGE_IN_THRESHOLD = float(os.environ.get('BARGE_IN_THRESHOLD', '0.92'))
+BARGE_IN_FRAMES = int(os.environ.get('BARGE_IN_FRAMES', '14'))  # ~448ms sustained
+
+
+def watch_for_barge_in(source, stop_event, threshold=None, frames_needed=None):
+    '''
+    listen while lulo is speaking and report if the user starts talking over her.
+
+    the pipeline was strictly half-duplex: nothing read the microphone during tts,
+    and the only echo protection was flushing the input buffer afterwards. the
+    patient physically could not interrupt, which is the single thing that most
+    made the interaction feel like a kiosk rather than a conversation.
+
+    this is safe to run concurrently with playback only because the main listen
+    loop is parked while it runs, so there is exactly one reader on the stream.
+
+    inputs:
+    source: the same audio source the listen loop uses
+    stop_event: threading.Event; set it to stand the watcher down
+    threshold: vad probability a frame must clear (default BARGE_IN_THRESHOLD)
+    frames_needed: consecutive frames required (default BARGE_IN_FRAMES)
+    outputs:
+    True when the user spoke over lulo, False when stopped or unavailable
+    '''
+    vad_model = get_vad_model()
+    stream = getattr(source, 'stream', None)
+    if vad_model is None or stream is None:
+        return False
+
+    threshold = BARGE_IN_THRESHOLD if threshold is None else threshold
+    frames_needed = BARGE_IN_FRAMES if frames_needed is None else frames_needed
+
+    np, torch = _get_stt_math()
+    vad_model.reset_states()
+    float_buf = np.empty(512, dtype=np.float32)
+    inv_scale = np.float32(1.0 / 32768.0)
+    audio_float = torch.from_numpy(float_buf)
+
+    raw_buffer = bytearray()
+    hits = 0
+    try:
+        while not stop_event.is_set():
+            chunk = stream.read(512)
+            if not chunk:
+                # a short read here means the sink went quiet, not that the user
+                # spoke, so stand down rather than guessing
+                return False
+            raw_buffer.extend(chunk)
+            while len(raw_buffer) >= 1024:
+                if stop_event.is_set():
+                    return False
+                frame_bytes = bytes(raw_buffer[:1024])
+                del raw_buffer[:1024]
+                audio_int16 = np.frombuffer(frame_bytes, dtype=np.int16)
+                np.multiply(audio_int16, inv_scale, out=float_buf)
+                if vad_model(audio_float, 16000).item() >= threshold:
+                    hits += 1
+                    if hits >= frames_needed:
+                        return True
+                else:
+                    hits = 0
+    except Exception:
+        return False
+    return False
 
 
 def listen_once(
@@ -492,6 +694,7 @@ def listen_once(
     use_silero=True,
     nod_callback=None,
     pause_threshold=None,
+    use_smart_turn=True,
 ):
     '''
     block for one complete utterance with adaptive continuation endpointing.
@@ -519,6 +722,7 @@ def listen_once(
                 min_silence_duration_s=silence_s,
                 non_speaking_duration_s=DEFAULT_NON_SPEAKING_S,
                 nod_callback=nod_callback,
+                use_smart_turn=use_smart_turn,
             )
         else:
             recognizer.pause_threshold = silence_s
@@ -535,6 +739,7 @@ def listen_once(
         return ''
 
     text, _ = transcribe_audio(recognizer, audio, swift_proc)
+    turn_metrics.note_stt_done()
     if is_hallucination(text):
         return ''
     text = text.strip()
@@ -550,6 +755,7 @@ def listen_once(
                     timeout=1.5,
                     phrase_time_limit=20,
                     min_silence_duration_s=continuation_silence_s,
+                use_smart_turn=use_smart_turn,
                     nod_callback=nod_callback,
                 )
             else:

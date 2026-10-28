@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import ssl
 import time
@@ -6,6 +7,8 @@ from pathlib import Path
 from queue import Empty, Queue
 
 from aiohttp import WSMsgType, web
+
+import turn_metrics
 from rich.console import Console
 
 try:
@@ -29,16 +32,24 @@ PHONE_MIC_IDLE_BAIL = 20.0
 # "the microphone is bad".
 FRAME_GAP_WARN_S = 0.25
 
+# ~20s of 16k pcm at the page's ~85ms chunk size. the queue stays bounded so a
+# wedged reader cannot grow it without limit, but it is now deep enough that a
+# slow stt call does not silently eat the start of the next utterance.
+PHONE_MIC_QUEUE_CHUNKS = 240
+
 
 class PhoneMicStream:
     '''
     mimics pyaudio stream read interface so whisper_stt silero vad can read directly
     '''
 
-    def __init__(self, audio_queue):
+    def __init__(self, audio_queue, is_connected=None):
         self.queue = audio_queue
         self.buffer = bytearray()
         self._closed = False
+        # lets a read give up quickly when the page is gone, instead of waiting
+        # out the full idle window for audio that cannot arrive
+        self._is_connected = is_connected
 
     def read(self, num_samples, exception_on_overflow=False):
         '''
@@ -61,6 +72,10 @@ class PhoneMicStream:
                 idle = 0.0
             except Empty:
                 idle += 0.5
+                if self._is_connected is not None and not self._is_connected():
+                    # no browser attached, so nothing is coming. bail now rather
+                    # than blocking the listen thread for the full idle window.
+                    break
                 if idle >= PHONE_MIC_IDLE_BAIL:
                     break
             except Exception:
@@ -91,8 +106,8 @@ class PhoneMicSource:
     SAMPLE_RATE = 16000
     SAMPLE_WIDTH = 2
 
-    def __init__(self, audio_queue):
-        self.stream = PhoneMicStream(audio_queue)
+    def __init__(self, audio_queue, is_connected=None):
+        self.stream = PhoneMicStream(audio_queue, is_connected=is_connected)
         self.SAMPLE_RATE = 16000
         self.SAMPLE_WIDTH = 2
 
@@ -109,9 +124,15 @@ class PhoneMicServer:
         self.port = port
         self.token = token or os.getenv('PEERBOTS_TOKEN', '')
         self.use_tunnel = use_tunnel
-        # ~2s of 16k pcm. deeper than this and the vad is always chewing on stale
-        # audio, so live speech queues up behind it and looks like a dead mic
-        self.audio_queue = Queue(maxsize=50)
+        # the listen thread blocks on a synchronous stt round trip while the phone
+        # keeps streaming, so the bound has to cover that gap or the oldest frames
+        # get dropped and the next utterance loses its opening words. 50 chunks was
+        # only ~4.2s at ~85ms a chunk, which a slow transcribe eats through.
+        self.audio_queue = Queue(maxsize=PHONE_MIC_QUEUE_CHUNKS)
+        self._dropped_chunks = 0
+        # set by the page when handset audio really finishes, awaited by the
+        # playback queue instead of sleeping on an estimate
+        self._playback_done = asyncio.Event()
         self._rms_sum = 0.0
         self._rms_frames = 0
         self._last_frame_time = None
@@ -149,7 +170,7 @@ class PhoneMicServer:
         # only one browser may stream at a time. multiple tabs interleaving pcm
         # into one queue sounds like noise and never transcribes.
         if self._client_ws is not None and not self._client_ws.closed:
-            console.print('[dim yellow][[phone-mic]]: another browser already streaming, rejecting this one (close extra tabs)[/]')
+            console.print('[dim yellow]\\[\\[phone-mic]]: another browser already streaming, rejecting this one (close extra tabs)[/]')
             return web.Response(status=409, text='another phone mic is already streaming')
 
         ws = web.WebSocketResponse(max_msg_size=1024 * 1024, heartbeat=30)
@@ -161,14 +182,14 @@ class PhoneMicServer:
         # a reconnect is not a gap; only measure arrivals within one session
         self._last_frame_time = None
         self._client_connected.set()
-        console.print('[bold green][[phone-mic]]: connected from browser! audio streaming started...[/]')
+        console.print('[bold green]\\[\\[phone-mic]]: connected from browser! audio streaming started...[/]')
         received_chunks = 0
         try:
             async for msg in ws:
                 if msg.type == WSMsgType.BINARY:
                     received_chunks += 1
                     if received_chunks == 1:
-                        console.print('[bold green][[phone-mic]]: receiving first audio frames from phone mic[/]')
+                        console.print('[bold green]\\[\\[phone-mic]]: receiving first audio frames from phone mic[/]')
                     self._note_frame_gap(time.time())
                     self._track_level(msg.data)
                     # drop oldest on overflow so latency stays bounded and we keep
@@ -179,10 +200,32 @@ class PhoneMicServer:
                         try:
                             self.audio_queue.get_nowait()
                             self.audio_queue.put_nowait(msg.data)
+                            # losing frames means the reader is far behind, which
+                            # costs words off the front of an utterance. it used to
+                            # happen silently, so nobody knew the mic was lossy.
+                            self._dropped_chunks += 1
+                            if self._dropped_chunks % 25 == 1:
+                                console.print(
+                                    f'[dim yellow]\\[\\[phone-mic]]: reader is behind, dropped '
+                                    f'{self._dropped_chunks} audio chunks (speech may be clipped)[/]'
+                                )
                         except Exception:
                             pass
+                elif msg.type == WSMsgType.TEXT:
+                    # control frames from the page. playback_done/playback_stopped
+                    # are the real end of handset audio, which the laptop used to
+                    # have to estimate from send time plus clip duration.
+                    try:
+                        payload = json.loads(msg.data)
+                    except Exception:
+                        payload = None
+                    kind = (payload or {}).get('type')
+                    if kind in ('playback_done', 'playback_stopped'):
+                        self._playback_done.set()
+                    elif kind == 'playback_started':
+                        turn_metrics.note_playback_started()
                 elif msg.type == WSMsgType.ERROR:
-                    console.print(f'[dim yellow][[phone-mic]]: ws error: {ws.exception()}[/]')
+                    console.print(f'[dim yellow]\\[\\[phone-mic]]: ws error: {ws.exception()}[/]')
         finally:
             self._connected = False
             self._client_ws = None
@@ -192,7 +235,7 @@ class PhoneMicServer:
             # the vad is currently collecting. stale audio is cleared on connect.
             err = None if ws.exception() is None else repr(ws.exception())
             console.print(
-                f'[dim yellow][[phone-mic]]: disconnected '
+                f'[dim yellow]\\[\\[phone-mic]]: disconnected '
                 f'(code={ws.close_code} chunks={received_chunks} err={err})[/]'
             )
         return ws
@@ -209,7 +252,7 @@ class PhoneMicServer:
         if gap >= FRAME_GAP_WARN_S:
             self._frame_gaps += 1
             console.print(
-                f'[dim yellow][[phone-mic]] link gap {gap:.2f}s '
+                f'[dim yellow]\\[\\[phone-mic]] link gap {gap:.2f}s '
                 f'({self._frame_gaps} total) - dropped audio, not silence[/]'
             )
 
@@ -239,7 +282,7 @@ class PhoneMicServer:
         if self._rms_frames >= 16000:
             rms = (self._rms_sum / self._rms_frames) ** 0.5
             bar = '#' * min(30, int(rms * 300))
-            console.print(f'[dim cyan][[phone-mic]] input rms {rms:.4f} |{bar}[/]')
+            console.print(f'[dim cyan]\\[\\[phone-mic]] input rms {rms:.4f} |{bar}[/]')
             self._rms_sum = 0.0
             self._rms_frames = 0
 
@@ -261,7 +304,7 @@ class PhoneMicServer:
         try:
             probe.bind(('0.0.0.0', self.port))
         except OSError as e:
-            console.print(f'[bold red][[phone-mic]]: port {self.port} is already in use ({e})[/]')
+            console.print(f'[bold red]\\[\\[phone-mic]]: port {self.port} is already in use ({e})[/]')
             console.print('[bold red]  another "main.py --phone-mic" is probably still running.[/]')
             console.print('[bold red]  stop it (ctrl-c, or: pkill -f "main.py --phone-mic") or pass --phone-port <other>[/]')
             raise SystemExit(1) from e
@@ -288,7 +331,7 @@ class PhoneMicServer:
         await self.site.start()
         scheme = 'https' if ssl_ctx else 'http'
         token_str = f'?token={self.token}' if self.token else ''
-        console.print(f'[bold green][[phone-mic]]: server listening on {scheme}://localhost:{self.port}/{token_str}[/]')
+        console.print(f'[bold green]\\[\\[phone-mic]]: server listening on {scheme}://localhost:{self.port}/{token_str}[/]')
 
         if self.use_tunnel:
             await self._start_cloudflared_tunnel()
@@ -301,10 +344,10 @@ class PhoneMicServer:
     async def _start_cloudflared_tunnel(self):
         cloudflared_bin = PHONE_MIC_DIR / 'tools' / 'cloudflared'
         if not cloudflared_bin.exists():
-            console.print(f'[dim yellow][[phone-mic]]: cloudflared binary not found at {cloudflared_bin}[/]')
+            console.print(f'[dim yellow]\\[\\[phone-mic]]: cloudflared binary not found at {cloudflared_bin}[/]')
             return
         token_str = f'?token={self.token}' if self.token else ''
-        console.print('[dim white][[phone-mic]]: requesting Cloudflare tunnel...[/]')
+        console.print('[dim white]\\[\\[phone-mic]]: requesting Cloudflare tunnel...[/]')
         import re
         try:
             self.tunnel_proc = await asyncio.create_subprocess_exec(
@@ -326,13 +369,13 @@ class PhoneMicServer:
                     match = re.search(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', line_str)
                     if match:
                         self.tunnel_url = match.group(0)
-                        console.print(f'[bold green][[phone-mic]]: Public HTTPS URL: {self.tunnel_url}/{token_str}[/]')
+                        console.print(f'[bold green]\\[\\[phone-mic]]: Public HTTPS URL: {self.tunnel_url}/{token_str}[/]')
                         console.print('  [dim white]Open this URL on any phone (no USB cable or ADB required)[/]')
                         break
 
             asyncio.create_task(_find_url())
         except Exception as e:
-            console.print(f'[dim yellow][[phone-mic]]: could not start cloudflared tunnel: {e}[/]')
+            console.print(f'[dim yellow]\\[\\[phone-mic]]: could not start cloudflared tunnel: {e}[/]')
 
     async def stop(self):
         # release any read parked waiting for the phone to come back
@@ -349,7 +392,7 @@ class PhoneMicServer:
             await self.runner.cleanup()
 
     def get_source(self):
-        source = PhoneMicSource(self.audio_queue)
+        source = PhoneMicSource(self.audio_queue, is_connected=self.is_connected)
         # keep the handle so shutdown can release a read that is blocked on a
         # phone which has stopped sending
         self.stream = source.stream
@@ -373,6 +416,47 @@ class PhoneMicServer:
             return True
         except Exception:
             return False
+
+    async def send_control(self, kind):
+        '''
+        send a json control frame to the page (e.g. 'interrupt' for barge-in).
+
+        inputs:
+        kind: control type string
+        outputs:
+        sent: boolean, false when no browser is attached
+        '''
+        ws = self._client_ws
+        if ws is None or ws.closed:
+            return False
+        try:
+            await ws.send_str(json.dumps({'type': kind}))
+            return True
+        except Exception:
+            return False
+
+    def reset_playback_ack(self):
+        '''arm the ack before sending a turn's audio'''
+        self._playback_done.clear()
+
+    async def wait_playback_ack(self, timeout):
+        '''
+        wait for the page to confirm handset audio finished.
+
+        inputs:
+        timeout: seconds to wait before falling back to the duration estimate
+        outputs:
+        acked: True if the browser confirmed, False on timeout
+        '''
+        try:
+            await asyncio.wait_for(self._playback_done.wait(), timeout=timeout)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def is_connected(self):
+        ws = self._client_ws
+        return ws is not None and not ws.closed
 
     async def wait_for_client(self, timeout=None):
         '''

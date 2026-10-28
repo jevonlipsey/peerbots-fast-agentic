@@ -10,6 +10,8 @@
 # Runtime State / IPC
 state/*.txt
 state/*.jpg
+# per-turn latency records, written every turn
+state/*.jsonl
 memory.jsonl
 
 # Swift Compilation Cache
@@ -306,3 +308,4 @@ fastlane/test_output
 # https://github.com/johnno1962/injectionforxcode
 
 iOSInjectionProject/
+models/

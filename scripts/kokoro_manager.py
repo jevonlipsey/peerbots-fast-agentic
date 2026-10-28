@@ -144,15 +144,15 @@ def start_kokoro_process():
         return None
 
 
+# these exist to warm the kokoro model and its http path, not to seed useful cache
+# entries: the cache key includes speed, and live turns ask for
+# get_voice_speed_for_emotion(...), which never equals DEFAULT_SPEED. the entries
+# that actually get hit are the dialogue-tree clauses in config/scripted_lines.json,
+# which main.prewarm_scripted_lines() synthesizes at their real per-emotion speeds.
 PREWARM_PHRASES = [
     "Hi! I'm Lulo. Nice to meet you! What's your name?",
-    'Hey! How are you doing today?',
     'hello there',
-    'awesome,',
-    'great,',
-    'sounds good!',
     "let's do it!",
-    "you got this!",
 ]
 
 

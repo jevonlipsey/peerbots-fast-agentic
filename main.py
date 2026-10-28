@@ -11,8 +11,10 @@ d) forward that json to the peerbots face via send_peerbots_message
 import argparse
 import asyncio
 import os
+import re
 import signal
 import sys
+import threading
 import time
 
 import speech_recognition as sr
@@ -20,16 +22,22 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 sys.path.append(os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts"))
+import smart_turn
 from whisper_stt import (
     IS_MAC,
     listen_once,
+    watch_for_barge_in,
     start_swift_worker,
     get_vad_model,
     prewarm_whisper,
 )
 from phone_mic_server import PhoneMicServer
+# module import as well as the names below: the body state provider is assigned
+# onto the module at startup, so it has to be reachable as an attribute.
+import openai_response
 from openai_response import (
     connect_mcp,
+    start_fresh_session,
     stream_peerbots_reply,
     prewarm_openai,
     start_openai_keepalive,
@@ -59,6 +67,7 @@ from droid_client import (
 from local_playback import LocalPlaybackQueue
 from phone_playback import PhoneSpeakerQueue
 from arm_controller import ArmController
+import turn_metrics
 
 load_dotenv()
 console = Console()
@@ -96,6 +105,55 @@ _PLAYBACK_QUEUE = None
 _USE_DROID = False
 _ARM = None  # usb serial linear-actuator body, set when --no-arduino is absent
 
+# how long one counted rep should take, end to end. "One... two... three..." is a
+# single tts clause, so kokoro reads it as one breath and the patient hears "123"
+# in well under a second -- useless as a pace to actually curl to. each number is
+# synthesized separately and held on the playback queue for this long instead.
+REP_SECONDS = float(os.environ.get("LULO_REP_SECONDS", "1.8"))
+
+_NUMBER_WORDS = (
+    "one two three four five six seven eight nine ten eleven twelve thirteen "
+    "fourteen fifteen sixteen seventeen eighteen nineteen twenty"
+).split()
+# a number word, plus whatever trailing dots/commas the model wrote after it
+_RE_COUNT_RUN = re.compile(
+    r"^\s*((?:(?:%s)\b[\s.,\u2026!]*){2,})(.*)$" % "|".join(_NUMBER_WORDS),
+    re.IGNORECASE | re.DOTALL,
+)
+_RE_COUNT_TOKEN = re.compile(
+    r"(?:%s)\b[\s.,\u2026!]*" % "|".join(_NUMBER_WORDS), re.IGNORECASE
+)
+
+
+def _rep_pacing_segments(text):
+    """
+    split a clause into (text, hold_seconds) pieces so counted reps land at rep pace.
+
+    only a run of two or more number words at the START of a clause counts, so
+    ordinary speech ("ten on each arm") is never broken up. anything after the run
+    is kept whole and unpaced, which is what carries the form cue.
+
+    inputs:
+    text: one speech clause
+    outputs:
+    list of (segment_text, hold_seconds); hold 0 means play at natural length
+    """
+    match = _RE_COUNT_RUN.match(text or "")
+    if not match:
+        return [(text, 0.0)]
+    run, remainder = match.group(1), match.group(2).strip()
+    tokens = [t.strip() for t in _RE_COUNT_TOKEN.findall(run) if t.strip()]
+    if len(tokens) < 2:
+        return [(text, 0.0)]
+    segments = [(t, REP_SECONDS) for t in tokens]
+    if remainder:
+        segments.append((remainder, 0.0))
+    return segments
+# roughly two seconds of phone mic audio. what a barge-in keeps: enough to hold
+# the words the user interrupted with, not the whole reply's worth of room noise.
+PHONE_MIC_BARGE_KEEP_CHUNKS = int(os.environ.get("PHONE_MIC_BARGE_KEEP_CHUNKS", "48"))
+_AUDIO_SINK = "tablet"  # droid | mac | phone | tablet, recorded in turn metrics
+
 ### dynamic voice speed per emotion
 EMOTION_SPEED_MAP = {
     "Happy": 1.12,
@@ -123,6 +181,13 @@ def get_voice_speed_for_emotion(emotion, base_speed=KOKORO_SPEED):
     if mult is not None:
         return round(mult * (base_speed / 1.0), 2)
     return base_speed
+
+
+def whisper_stt_probe():
+    '''the silence this build probes at, for the startup banner'''
+    from whisper_stt import SMART_TURN_PROBE_S
+
+    return SMART_TURN_PROBE_S
 
 
 def make_nod_callback(loop):
@@ -160,6 +225,129 @@ def make_nod_callback(loop):
     return _on_nod
 
 
+# kokoro is a freshly-launched local server at this point, so the prewarm burst
+# is paced rather than fired all at once
+PREWARM_CONCURRENCY = 4
+
+SCRIPTED_LINES_FILE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "config", "scripted_lines.json"
+)
+
+
+def _scripted_clauses():
+    '''
+    the exact tts cache keys an on-script reply will ask for.
+
+    the cache is keyed on the clause text the streaming parser emits, not on the
+    whole reply, so prewarming a full dialogue-tree line would never be hit. each
+    line is therefore pushed through that same parser to recover its real clause
+    boundaries.
+
+    inputs:
+    none
+    outputs:
+    list of (clause_text, emotion) pairs
+    '''
+    import json
+
+    from openai_response import StreamingReplyParser
+
+    try:
+        with open(SCRIPTED_LINES_FILE, encoding="utf-8") as fh:
+            lines = json.load(fh).get("lines", [])
+    except Exception:
+        return []
+
+    clauses = []
+    for entry in lines:
+        speech = entry.get("speech", "")
+        emotion = entry.get("emotion", "Neutral")
+        if not speech:
+            continue
+        # shaped exactly like a real strict-schema reply so the parser splits it
+        # the way it will at run time
+        payload = json.dumps(
+            {
+                "emotion": emotion,
+                "color": "White",
+                "turn_action": "lulo turns to user",
+                "speech": speech,
+            }
+        )
+        parser = StreamingReplyParser()
+        parts = []
+        # feed in small slices so clause flushing behaves as it does on a token
+        # stream rather than on one complete string
+        for i in range(0, len(payload), 8):
+            parts.extend(parser.feed(payload[i : i + 8]))
+        parts.extend(parser.finish())
+        for clause in parts:
+            if clause.strip():
+                clauses.append((clause, emotion))
+    return clauses
+
+
+async def prewarm_scripted_lines():
+    '''
+    synthesize every scripted clause ahead of time, at its live speed.
+
+    the demo follows a known dialogue tree, so each of those replies can be served
+    from the in-memory kokoro cache for 0ms instead of ~300ms of synthesis. the
+    speed has to match exactly or the lookup misses: the generic prewarm used
+    DEFAULT_SPEED while live turns ask for get_voice_speed_for_emotion(...), so
+    before this nothing but the greeting ever hit.
+
+    inputs:
+    none
+    outputs:
+    count of clauses cached
+    '''
+    clauses = _scripted_clauses()
+    if not clauses:
+        return 0
+
+    # dedupe on the real cache key: variants of the same line share clauses
+    wanted = {}
+    for clause, emotion in clauses:
+        wanted.setdefault(
+            (clause, get_voice_speed_for_emotion(emotion, KOKORO_SPEED)), None
+        )
+
+    # ensure_kokoro_ready returns as soon as the health check passes, and firing
+    # forty-odd requests at a server that has only just come up loses a third of
+    # them. an uncached scripted line costs ~300ms of synthesis mid-demo, so this
+    # paces the burst and retries once rather than accepting a partial cache.
+    gate = asyncio.Semaphore(PREWARM_CONCURRENCY)
+
+    async def _one(clause, speed):
+        async with gate:
+            return await synthesize_speech(clause, voice=KOKORO_VOICE, speed=speed)
+
+    async def _pass(keys):
+        results = await asyncio.gather(
+            *(_one(c, sp) for c, sp in keys), return_exceptions=True
+        )
+        ok, failed = 0, []
+        for key, r in zip(keys, results):
+            if isinstance(r, (bytes, bytearray)) and r:
+                ok += 1
+            else:
+                failed.append(key)
+        return ok, failed
+
+    cached, failed = await _pass(list(wanted))
+    if failed:
+        await asyncio.sleep(0.5)
+        retried, still_failed = await _pass(failed)
+        cached += retried
+        if still_failed:
+            console.print(
+                f"[dim yellow]\\[\\[audio]]: {len(still_failed)} scripted clause(s) "
+                f"would not synthesize; those lines pay full tts[/]"
+            )
+    return cached
+
+
 async def send_greeting():
     # spoken greeting once the whole pipeline is ready
     global _USE_DROID, _PLAYBACK_QUEUE
@@ -173,10 +361,15 @@ async def send_greeting():
                 GREETING_SPEECH,
                 GREETING_EMOTION,
                 GREETING_COLOR,
-                silent=not PEERBOTS_DUAL_AUDIO,
+                # kokoro owns the voice here; the tablet gets the text only so
+                # the mouth moves. volume 1.0 would play a second voice under it.
+                silent=True,
             )
             audio_bytes = await synthesize_speech(
-                GREETING_SPEECH, voice=KOKORO_VOICE, speed=KOKORO_SPEED
+                GREETING_SPEECH,
+                voice=KOKORO_VOICE,
+                # same speed the scripted prewarm cached it at, or the lookup misses
+                speed=get_voice_speed_for_emotion(GREETING_EMOTION, KOKORO_SPEED),
             )
             if audio_bytes:
                 await _PLAYBACK_QUEUE.enqueue(audio_bytes, chunk_idx=0)
@@ -197,12 +390,65 @@ async def _delayed_think(delay):
     # latency mask: stays silent unless the llm is slower than delay
     await asyncio.sleep(delay)
     try:
-        await asend_peerbots_message(THINKING_SPEECH, THINKING_EMOTION, THINKING_COLOR)
+        await asend_peerbots_message(
+            THINKING_SPEECH, THINKING_EMOTION, THINKING_COLOR, silent=_USE_DROID
+        )
     except Exception as e:
         console.print(f"[dim yellow][[ thinking mask failed: {e} ]][/]")
 
 
-async def handle_turn(user_text, tools_list, tool_router):
+async def _play_or_be_interrupted(mic_source):
+    '''
+    wait out lulo's audio, but let the user cut in.
+
+    the pipeline was strictly half-duplex: handle_turn awaited the playback queue
+    and nothing read the microphone until it drained, so the patient could not
+    interrupt at all. the one-shot input flush afterwards also meant anything
+    arriving late was read as the next user turn.
+
+    this is safe because the main listen loop is parked here, so the watcher is
+    the only reader on the stream while it runs.
+
+    inputs:
+    mic_source: the live audio source, or None to just wait
+    outputs:
+    True when the user spoke over lulo and playback was cut
+    '''
+    playback = asyncio.create_task(_PLAYBACK_QUEUE.wait_complete())
+    if mic_source is None or not hasattr(_PLAYBACK_QUEUE, "interrupt"):
+        await playback
+        return False
+
+    stop_flag = threading.Event()
+    watcher = asyncio.create_task(
+        asyncio.to_thread(watch_for_barge_in, mic_source, stop_flag)
+    )
+    try:
+        done, _pending = await asyncio.wait(
+            [playback, watcher], return_when=asyncio.FIRST_COMPLETED
+        )
+        if watcher in done and not playback.done() and watcher.result():
+            console.print("  [bold yellow]-> [barge-in] user spoke, stopping audio[/]")
+            await _PLAYBACK_QUEUE.interrupt()
+            playback.cancel()
+            try:
+                await playback
+            except (asyncio.CancelledError, Exception):
+                pass
+            return True
+        await playback
+        return False
+    finally:
+        stop_flag.set()
+        if not watcher.done():
+            watcher.cancel()
+        try:
+            await watcher
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+async def handle_turn(user_text, tools_list, tool_router, mic_source=None):
     # streaming turn: early emotion -> peerbots face, sentence -> kokoro -> droid queue
     global _USE_DROID, _PLAYBACK_QUEUE
     console.print(f"\n[bold cyan][[USER]]:[/] {user_text}")
@@ -214,6 +460,14 @@ async def handle_turn(user_text, tools_list, tool_router):
     )
 
     turn_start = time.time()
+    # the real span starts where the user stopped talking, which only the vad
+    # thread saw. the old metric started here, after stt had already returned.
+    timer = turn_metrics.TurnTimer(
+        capture=turn_metrics.take_capture(),
+        model=os.environ.get("OPENAI_MODEL", ""),
+        audio_sink=_AUDIO_SINK,
+    )
+    turn_metrics.arm_playback()
     if _USE_DROID and _PLAYBACK_QUEUE:
         _PLAYBACK_QUEUE.reset_turn()
 
@@ -231,7 +485,9 @@ async def handle_turn(user_text, tools_list, tool_router):
     chunk_order_events[0].set()
 
     try:
+        timer.mark("llm_start")
         async for event in stream_peerbots_reply(user_text, tools_list, tool_router):
+            timer.mark("first_token")
             # cancel thinking filler as soon as the first stream event arrives
             if think_task and not think_task.done():
                 think_task.cancel()
@@ -246,8 +502,15 @@ async def handle_turn(user_text, tools_list, tool_router):
                 if _ARM is not None:
                     # physically react to lulo's emotion the moment the face changes
                     _ARM.fire_emotion(emotion)
-                if _USE_DROID and not PEERBOTS_DUAL_AUDIO:
-                    # silent update without speech if dual audio is off
+                if _USE_DROID:
+                    # fire the face the moment the emotion token lands, in dual
+                    # audio mode too. the only face update in that mode used to be
+                    # the one carrying the full speech text at the very end of the
+                    # turn, and the peerbots cloud can take 4-5s to deliver it, so
+                    # lulo would speak a Concerned/Red escalation line while still
+                    # wearing the previous face. this update carries no speech, so
+                    # it cannot duplicate audio; the later send still drives the
+                    # mouth for lip-sync.
                     fire_peerbots_update("", emotion, color, silent=True)
                 console.print(f"  [dim white]-> [face] {emotion} / {color}[/]")
 
@@ -257,6 +520,7 @@ async def handle_turn(user_text, tools_list, tool_router):
                 spoken_sentences.append(sent)
                 if chunk_idx == 0:
                     first_clause_time = time.time()
+                timer.mark("first_clause")
 
                 if _USE_DROID and _PLAYBACK_QUEUE:
                     # concurrently synthesize this sentence with kokoro and stream into playback queue
@@ -266,21 +530,50 @@ async def handle_turn(user_text, tools_list, tool_router):
                         target_speed = get_voice_speed_for_emotion(
                             current_emotion, KOKORO_SPEED
                         )
-                        audio_data = await synthesize_speech(
-                            sentence_text, voice=KOKORO_VOICE, speed=target_speed
-                        )
+                        # a counted run becomes one piece of audio per number, each
+                        # held for a rep. everything else is a single segment, so
+                        # ordinary replies take exactly the path they always did.
+                        segments = _rep_pacing_segments(sentence_text)
+                        parts = []
+                        for seg_text, hold_s in segments:
+                            parts.append(
+                                (
+                                    await synthesize_speech(
+                                        seg_text, voice=KOKORO_VOICE, speed=target_speed
+                                    ),
+                                    hold_s,
+                                )
+                            )
                         s_ms = int((time.time() - s_start) * 1000)
                         if idx == 0:
                             tts1_ms = s_ms
+                        timer.mark("first_synth")
                         if idx not in chunk_order_events:
                             chunk_order_events[idx] = asyncio.Event()
                         try:
                             await chunk_order_events[idx].wait()
-                            if audio_data:
+                            is_first_part = True
+                            for audio_data, hold_s in parts:
+                                if not audio_data:
+                                    continue
                                 if not first_audio_sent:
                                     first_audio_sent = True
                                     first_audio_time = time.time()
-                                await _PLAYBACK_QUEUE.enqueue(audio_data, chunk_idx=idx)
+                                    timer.mark("first_audio_sent")
+                                hold = None
+                                if hold_s:
+                                    # pad the pacing, never clip a number that
+                                    # happens to take longer than a rep to say
+                                    hold = max(hold_s, get_audio_duration_s(audio_data))
+                                await _PLAYBACK_QUEUE.enqueue(
+                                    audio_data,
+                                    duration_s=hold,
+                                    # only the first piece carries the ordering index;
+                                    # the rest ride behind it, or the queue logs a
+                                    # chunk inversion for every number.
+                                    chunk_idx=idx if is_first_part else None,
+                                )
+                                is_first_part = False
                         finally:
                             next_idx = idx + 1
                             if next_idx not in chunk_order_events:
@@ -297,12 +590,15 @@ async def handle_turn(user_text, tools_list, tool_router):
                     full_text = final_reply.get("speech", "") or " ".join(
                         spoken_sentences
                     )
-                    # send speech to peerbots to animate mouth; browser audio is muted on android
+                    # send speech to peerbots to animate the mouth. this used to
+                    # assume the tablet browser was muted on android; on the handset
+                    # it is not, so volume 1.0 played the cloud tts underneath
+                    # kokoro. text still goes up, volume does not.
                     fire_peerbots_update(
                         full_text,
                         final_reply.get("emotion", current_emotion),
                         final_reply.get("color", "White"),
-                        silent=False,
+                        silent=True,
                     )
 
     finally:
@@ -316,9 +612,10 @@ async def handle_turn(user_text, tools_list, tool_router):
     if tts_tasks:
         await asyncio.gather(*tts_tasks, return_exceptions=True)
 
+    interrupted = False
     if _USE_DROID and _PLAYBACK_QUEUE and spoken_sentences:
-        # wait for droid audio queue to finish playing completely before re-opening mic
-        await _PLAYBACK_QUEUE.wait_complete()
+        # stay listening while she talks, so she can be interrupted
+        interrupted = await _play_or_be_interrupted(mic_source)
     elif not _USE_DROID and final_reply:
         # fallback: tablet tts handles speech and face together
         try:
@@ -348,22 +645,35 @@ async def handle_turn(user_text, tools_list, tool_router):
     emotion_disp = final_reply.get("emotion", "Neutral") if final_reply else "Neutral"
     color_disp = final_reply.get("color", "White") if final_reply else "White"
 
+    # the sink reports when sound actually left the speaker, where it can
+    started = turn_metrics.take_playback_started()
+    if started is not None:
+        timer.stamps["playback_started"] = started
+    timer.mark("turn_done")
+    timer.set("emotion", emotion_disp)
+    timer.set("color", color_disp)
+    timer.set("turn_action", turn_action_disp)
+    timer.set("chunks", len(spoken_sentences))
+    timer.set("interrupted", interrupted)
+    record = timer.write()
+
+    console.print(
+        f"  [bright_yellow]-> [Metrics] {turn_metrics.format_console(record)}"
+        f" | {emotion_disp} / {color_disp} | Gaze: {turn_action_disp}[/]"
+    )
+    if interrupted:
+        console.print(
+            "  [dim yellow]   (interrupted - keeping buffered audio for the next turn)[/]"
+        )
     if first_audio_time:
-        ttfa_s = first_audio_time - turn_start
-        ttft_ms = metrics.get("ttft_ms", 0)
-        clause1_ms = (
-            int((first_clause_time - turn_start) * 1000) if first_clause_time else 0
-        )
-        face_ms = metrics.get("face_ms", 0)
+        # kept alongside the real span so the old figure stays comparable
         console.print(
-            f"  [bright_yellow]-> [Metrics] TTFA: {ttfa_s:.2f}s "
-            f"(TTFT: {ttft_ms}ms | Clause1: {clause1_ms}ms | TTS1: {tts1_ms}ms | Face: {face_ms}ms) "
-            f"| Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp} | Gaze: {turn_action_disp}[/]"
+            f"  [dim]   legacy TTFA (post-stt, pre-upload): "
+            f"{first_audio_time - turn_start:.2f}s"
+            f" | TTFT {metrics.get('ttft_ms', 0)}ms | TTS1 {tts1_ms}ms"
+            f" | Total {total_turn_s:.2f}s[/]"
         )
-    else:
-        console.print(
-            f"  [bright_yellow]-> [Metrics] Total: {total_turn_s:.2f}s | {emotion_disp} / {color_disp} | Gaze: {turn_action_disp}[/]"
-        )
+    return interrupted
 
 
 def list_mics():
@@ -526,6 +836,7 @@ async def mic_loop(
     tool_router,
     pause_threshold=PAUSE_THRESHOLD,
     use_silero=True,
+    use_smart_turn=True,
 ):
     # blocking mic loop, runs until ctrl-c
     global _CURRENT_SWIFT_PROC
@@ -539,7 +850,7 @@ async def mic_loop(
                 f"[dim yellow][[ coreml worker failed, whisper fallback: {e} ]]"
             )
     if swift_proc is None:
-        console.print("[dim white][[stt]]: local whisper (base.en) active, warming model[/]")
+        console.print("[dim white]\\[\\[stt]]: local whisper (base.en) active, warming model[/]")
         prewarm_whisper()
 
     recognizer = sr.Recognizer()
@@ -549,11 +860,11 @@ async def mic_loop(
     vad_available = use_silero and (get_vad_model() is not None)
     if vad_available:
         console.print(
-            f"[dim white][[stt]]: neural silero-vad endpointing active (pause_threshold={pause_threshold}s)[/]"
+            f"[dim white]\\[\\[stt]]: neural silero-vad endpointing active (pause_threshold={pause_threshold}s)[/]"
         )
     else:
         console.print(
-            f"[dim white][[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]"
+            f"[dim white]\\[\\[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]"
         )
 
     loop = asyncio.get_running_loop()
@@ -599,6 +910,7 @@ async def mic_loop(
                 use_silero=vad_available,
                 nod_callback=nod_cb,
                 pause_threshold=pause_threshold,
+                use_smart_turn=use_smart_turn,
             )
             if IS_MAC and swift_proc is not None and swift_proc.poll() is not None:
                 console.print("[dim white][[ reviving crashed stt worker... ]][/]")
@@ -611,20 +923,25 @@ async def mic_loop(
                     )
                     swift_proc = None
             if text:
-                await handle_turn(text, tools_list, tool_router)
-                # discard buffered audio frames recorded during robot speaking to avoid echo loops
-                try:
-                    # source.stream is a MicrophoneStream wrapper; the raw pyaudio
-                    # stream lives one level down and is what exposes read-available
-                    raw_stream = getattr(
-                        getattr(source, "stream", None), "pyaudio_stream", None
-                    )
-                    if raw_stream is not None:
-                        available = raw_stream.get_read_available()
-                        if available > 0:
-                            raw_stream.read(available, exception_on_overflow=False)
-                except Exception:
-                    pass
+                was_interrupted = await handle_turn(
+                    text, tools_list, tool_router, mic_source=source
+                )
+                # flushing after a barge-in would throw away the words the user is
+                # in the middle of saying, which is the whole point of barge-in
+                if not was_interrupted:
+                    try:
+                        # source.stream is a MicrophoneStream wrapper; the raw
+                        # pyaudio stream lives one level down and is what exposes
+                        # read-available
+                        raw_stream = getattr(
+                            getattr(source, "stream", None), "pyaudio_stream", None
+                        )
+                        if raw_stream is not None:
+                            available = raw_stream.get_read_available()
+                            if available > 0:
+                                raw_stream.read(available, exception_on_overflow=False)
+                    except Exception:
+                        pass
                 console.print("\n[bold dark_orange][[LISTENING]][/]")
 
 
@@ -636,6 +953,7 @@ async def phone_mic_loop(
     use_tunnel=False,
     pause_threshold=PAUSE_THRESHOLD,
     use_silero=True,
+    use_smart_turn=True,
     phone_audio=False,
 ):
     # stream audio from phone browser over websocket
@@ -650,7 +968,7 @@ async def phone_mic_loop(
                 f"[dim yellow][[ coreml worker failed, whisper fallback: {e} ]]"
             )
     if swift_proc is None:
-        console.print("[dim white][[stt]]: local whisper (base.en) active, warming model[/]")
+        console.print("[dim white]\\[\\[stt]]: local whisper (base.en) active, warming model[/]")
         prewarm_whisper()
 
     server = PhoneMicServer(port=port, token=token, use_tunnel=use_tunnel)
@@ -668,11 +986,11 @@ async def phone_mic_loop(
     vad_available = use_silero and (get_vad_model() is not None)
     if vad_available:
         console.print(
-            f"[dim white][[stt]]: neural silero-vad endpointing active (pause_threshold={pause_threshold}s)[/]"
+            f"[dim white]\\[\\[stt]]: neural silero-vad endpointing active (pause_threshold={pause_threshold}s)[/]"
         )
     else:
         console.print(
-            f"[dim white][[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]"
+            f"[dim white]\\[\\[stt]]: legacy vad active (pause_threshold={pause_threshold}s)[/]"
         )
 
     loop = asyncio.get_running_loop()
@@ -705,6 +1023,7 @@ async def phone_mic_loop(
                 use_silero=vad_available,
                 nod_callback=nod_cb,
                 pause_threshold=pause_threshold,
+                use_smart_turn=use_smart_turn,
             )
             if IS_MAC and swift_proc is not None and swift_proc.poll() is not None:
                 console.print("[dim white][[ reviving crashed stt worker... ]][/]")
@@ -717,9 +1036,18 @@ async def phone_mic_loop(
                     )
                     swift_proc = None
             if text:
-                await handle_turn(text, tools_list, tool_router)
-                # clear audio queue of any audio recorded during robot speech
-                while not server.audio_queue.empty():
+                was_interrupted = await handle_turn(
+                    text, tools_list, tool_router, mic_source=source
+                )
+                # after a barge-in the queue holds the user's live speech, so
+                # draining it would discard the interruption itself. it also holds
+                # everything the room said while lulo was replying, though, and on
+                # a long turn that is tens of seconds of stale audio sitting in
+                # front of the interruption. transcribing the backlog first is how
+                # a turn comes back doubled or garbled, so keep the tail and drop
+                # the history.
+                keep = 0 if not was_interrupted else PHONE_MIC_BARGE_KEEP_CHUNKS
+                while server.audio_queue.qsize() > keep:
                     try:
                         server.audio_queue.get_nowait()
                     except Exception:
@@ -748,6 +1076,7 @@ async def amain(
     pause_threshold=PAUSE_THRESHOLD,
     enable_droid=USE_DROID_AUDIO,
     use_silero=True,
+    use_smart_turn=True,
     enable_dual_audio=PEERBOTS_DUAL_AUDIO,
     use_phone_mic=False,
     phone_mic_port=8443,
@@ -756,9 +1085,20 @@ async def amain(
     local_audio=False,
     phone_audio=False,
     enable_arduino=True,
+    fresh_history=True,
 ):
-    global _USE_DROID, _PLAYBACK_QUEUE, PEERBOTS_DUAL_AUDIO, _ARM
+    global _USE_DROID, _PLAYBACK_QUEUE, PEERBOTS_DUAL_AUDIO, _ARM, _AUDIO_SINK
     PEERBOTS_DUAL_AUDIO = enable_dual_audio
+
+    if fresh_history:
+        archived = start_fresh_session()
+        if archived:
+            console.print(
+                f"[dim white][[ previous session archived to {os.path.basename(archived)}, "
+                f"starting fresh ]][/]"
+            )
+    else:
+        console.print("[dim yellow][[ keeping previous session history ]][/]")
     missing = [
         k
         for k in ("OPENAI_API_KEY", "PEERBOTS_API_KEY", "PEERBOTS_USERNAME")
@@ -786,6 +1126,16 @@ async def amain(
         console.print("[dim white][[ checking kokoro tts & droid audio daemon... ]][/]")
         koko_ok = await ensure_kokoro_ready()
         if koko_ok:
+            cached = await prewarm_scripted_lines()
+            if cached:
+                console.print(
+                    f"[dim white][[ cached {cached} scripted dialogue-tree clauses "
+                    f"(on-script replies skip tts) ]][/]"
+                )
+            else:
+                console.print(
+                    "[dim yellow][[ no scripted audio cached; every reply pays full tts ]][/]"
+                )
             if phone_audio:
                 if not use_phone_mic:
                     console.print("[bold red][[ --phone-audio needs --phone-mic ]][/]")
@@ -796,6 +1146,7 @@ async def amain(
             elif await ais_droid_reachable():
                 audio_sink = 'droid'
 
+    _AUDIO_SINK = audio_sink
     if audio_sink == 'tablet':
         if enable_droid:
             reasons = []
@@ -814,7 +1165,7 @@ async def amain(
             _PLAYBACK_QUEUE = DroidPlaybackQueue()
             await _PLAYBACK_QUEUE.start()
             console.print(
-                f"[bold green][[audio]]: streaming Kokoro MPS -> Droid daemon (100.119.180.97){mode_str}[/]"
+                f"[bold green]\\[\\[audio]]: streaming Kokoro MPS -> Droid daemon (100.119.180.97){mode_str}[/]"
             )
             try:
                 probe_res = await probe_droid_daemon()
@@ -831,18 +1182,42 @@ async def amain(
             _PLAYBACK_QUEUE = LocalPlaybackQueue()
             await _PLAYBACK_QUEUE.start()
             console.print(
-                f"[bold green][[audio]]: streaming Kokoro MPS -> local speakers{mode_str}[/]"
+                f"[bold green]\\[\\[audio]]: streaming Kokoro MPS -> local speakers{mode_str}[/]"
             )
         else:
             # the queue is built in phone_mic_loop once the server exists
             console.print(
-                f"[bold green][[audio]]: streaming Kokoro MPS -> phone browser speakers{mode_str}[/]"
+                f"[bold green]\\[\\[audio]]: streaming Kokoro MPS -> phone browser speakers{mode_str}[/]"
             )
 
     # bring up the physical body (linear actuator over usb serial) if requested
     if enable_arduino:
         _ARM = ArmController()
         await _ARM.start()
+        # let the model see where the body actually is. without this it is told it
+        # has a height it can change but is never told what that height currently
+        # is, so it cannot reason about growing taller or settling back down.
+        openai_response.BODY_STATE_PROVIDER = _ARM.last_known_position
+
+    # semantic endpointing: load and warm the graph now, not on the first turn
+    if use_smart_turn:
+        if smart_turn.model_available():
+            if await asyncio.to_thread(smart_turn.prewarm):
+                console.print(
+                    "[bold green]\\[\\[stt]]: semantic end-of-turn detection active "
+                    f"(probe at {whisper_stt_probe()}s, cap at {pause_threshold}s)[/]"
+                )
+            else:
+                console.print(
+                    "[dim yellow]\\[\\[stt]]: smart-turn model failed to load, "
+                    "using the fixed silence window[/]"
+                )
+        else:
+            console.print(
+                "[dim yellow]\\[\\[stt]]: no smart-turn model; endpointing falls back to "
+                f"a fixed {pause_threshold}s window. "
+                "get it with: python scripts/smart_turn.py --download[/]"
+            )
 
     # prewarm openai connection pool and start keepalive
     console.print("[dim white][[ pre-warming openai connection pool... ]][/]")
@@ -866,6 +1241,7 @@ async def amain(
                     use_tunnel=use_tunnel,
                     pause_threshold=pause_threshold,
                     use_silero=use_silero,
+                    use_smart_turn=use_smart_turn,
                     phone_audio=phone_audio,
                 )
             else:
@@ -875,6 +1251,7 @@ async def amain(
                     tool_router,
                     pause_threshold=pause_threshold,
                     use_silero=use_silero,
+                    use_smart_turn=use_smart_turn,
                 )
     except (asyncio.CancelledError, KeyboardInterrupt):
         pass
@@ -911,6 +1288,11 @@ def main():
         type=float,
         default=PAUSE_THRESHOLD,
         help="seconds of silence before speech is considered done (default: 1.0)",
+    )
+    parser.add_argument(
+        "--no-smart-turn",
+        action="store_true",
+        help="disable semantic end-of-turn detection and use the fixed silence window",
     )
     parser.add_argument(
         "--legacy-vad",
@@ -969,6 +1351,16 @@ def main():
         "--list-mics", action="store_true", help="print all microphones and exit"
     )
     parser.add_argument(
+        "--preflight",
+        action="store_true",
+        help="check every subsystem and exit (run this before a demo)",
+    )
+    parser.add_argument(
+        "--keep-history",
+        action="store_true",
+        help="carry the previous session's conversation over instead of starting fresh",
+    )
+    parser.add_argument(
         "--no-arduino",
         action="store_true",
         help="disable the usb serial linear-actuator body",
@@ -997,6 +1389,17 @@ def main():
         help="alias for --list-arm-ports",
     )
     args = parser.parse_args()
+    if args.preflight:
+        from preflight import run as run_preflight
+
+        ok = asyncio.run(
+            run_preflight(
+                phone_port=args.phone_port,
+                check_arduino=not args.no_arduino,
+                check_mic=not args.phone_mic,
+            )
+        )
+        sys.exit(0 if ok else 1)
     if args.list_mics:
         list_mics()
         return
@@ -1026,6 +1429,7 @@ def main():
                 pause_threshold=args.pause_threshold,
                 enable_droid=not args.no_droid,
                 use_silero=not args.legacy_vad,
+                use_smart_turn=not args.no_smart_turn,
                 enable_dual_audio=not args.no_dual_audio,
                 use_phone_mic=args.phone_mic,
                 phone_mic_port=args.phone_port,
@@ -1034,6 +1438,7 @@ def main():
                 local_audio=args.local_audio,
                 phone_audio=args.phone_audio,
                 enable_arduino=not args.no_arduino,
+                fresh_history=not args.keep_history,
             )
         )
     except (KeyboardInterrupt, *_ExceptionGroupTypes):
