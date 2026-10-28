@@ -104,6 +104,28 @@ def _headers():
     return _CACHED_HEADERS
 
 
+def _build_payload(speech, emotion, color, silent):
+    """
+    shape one face message.
+
+    'volume': 0.0 is not enough on its own. the face app speaks whatever arrives
+    in 'speech' regardless of the volume field, so when kokoro owns the voice the
+    text itself has to stay home or the cloud tts plays underneath the handset.
+    a silent update is therefore a pure emotion/colour update.
+    """
+    safe_emotion = _normalize(emotion, _VALID_EMOTIONS_MAP, 'Neutral')
+    safe_color = _normalize(color, _VALID_COLORS_MAP, DEFAULT_COLOR)
+    text = '' if silent else (speech or '').strip()
+    title = (text[:60] if len(text) <= 60 else text[:57] + '...') if text else 'Face Update'
+    return {
+        'title': title,
+        'speech': text,
+        'color': safe_color,
+        'emotion': safe_emotion,
+        'volume': 0.0 if silent else 1.0,
+    }
+
+
 def send_peerbots_message(speech='', emotion='Neutral', color=DEFAULT_COLOR, silent=False):
     """
     send one face message to the configured peerbots user (sync).
@@ -122,19 +144,7 @@ def send_peerbots_message(speech='', emotion='Neutral', color=DEFAULT_COLOR, sil
     if not (os.environ.get('PEERBOTS_API_KEY', '') or PEERBOTS_API_KEY):
         raise ValueError('PEERBOTS_API_KEY is not set. check your .env file.')
 
-    safe_emotion = _normalize(emotion, _VALID_EMOTIONS_MAP, 'Neutral')
-    safe_color = _normalize(color, _VALID_COLORS_MAP, DEFAULT_COLOR)
-    text = (speech or '').strip()
-
-    title = (text[:60] if len(text) <= 60 else text[:57] + '...') if text else 'Face Update'
-
-    payload = {
-        'title': title,
-        'speech': text,
-        'color': safe_color,
-        'emotion': safe_emotion,
-        'volume': 0.0 if silent else 1.0,
-    }
+    payload = _build_payload(speech, emotion, color, silent)
 
     timeout = SILENT_TIMEOUT_S if silent else DEFAULT_TIMEOUT_S
     url = _get_send_url(username)
@@ -163,19 +173,7 @@ async def asend_peerbots_message(speech='', emotion='Neutral', color=DEFAULT_COL
     if not (os.environ.get('PEERBOTS_API_KEY', '') or PEERBOTS_API_KEY):
         return None
 
-    safe_emotion = _normalize(emotion, _VALID_EMOTIONS_MAP, 'Neutral')
-    safe_color = _normalize(color, _VALID_COLORS_MAP, DEFAULT_COLOR)
-    text = (speech or '').strip()
-
-    title = (text[:60] if len(text) <= 60 else text[:57] + '...') if text else 'Face Update'
-
-    payload = {
-        'title': title,
-        'speech': text,
-        'color': safe_color,
-        'emotion': safe_emotion,
-        'volume': 0.0 if silent else 1.0,
-    }
+    payload = _build_payload(speech, emotion, color, silent)
 
     timeout = SILENT_TIMEOUT_S if silent else DEFAULT_TIMEOUT_S
     url = _get_send_url(username)

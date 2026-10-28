@@ -11,6 +11,7 @@ d) forward that json to the peerbots face via send_peerbots_message
 import argparse
 import asyncio
 import os
+import re
 import signal
 import sys
 import threading
@@ -31,6 +32,9 @@ from whisper_stt import (
     prewarm_whisper,
 )
 from phone_mic_server import PhoneMicServer
+# module import as well as the names below: the body state provider is assigned
+# onto the module at startup, so it has to be reachable as an attribute.
+import openai_response
 from openai_response import (
     connect_mcp,
     start_fresh_session,
@@ -100,6 +104,54 @@ _CURRENT_SWIFT_PROC = None
 _PLAYBACK_QUEUE = None
 _USE_DROID = False
 _ARM = None  # usb serial linear-actuator body, set when --no-arduino is absent
+
+# how long one counted rep should take, end to end. "One... two... three..." is a
+# single tts clause, so kokoro reads it as one breath and the patient hears "123"
+# in well under a second -- useless as a pace to actually curl to. each number is
+# synthesized separately and held on the playback queue for this long instead.
+REP_SECONDS = float(os.environ.get("LULO_REP_SECONDS", "1.8"))
+
+_NUMBER_WORDS = (
+    "one two three four five six seven eight nine ten eleven twelve thirteen "
+    "fourteen fifteen sixteen seventeen eighteen nineteen twenty"
+).split()
+# a number word, plus whatever trailing dots/commas the model wrote after it
+_RE_COUNT_RUN = re.compile(
+    r"^\s*((?:(?:%s)\b[\s.,\u2026!]*){2,})(.*)$" % "|".join(_NUMBER_WORDS),
+    re.IGNORECASE | re.DOTALL,
+)
+_RE_COUNT_TOKEN = re.compile(
+    r"(?:%s)\b[\s.,\u2026!]*" % "|".join(_NUMBER_WORDS), re.IGNORECASE
+)
+
+
+def _rep_pacing_segments(text):
+    """
+    split a clause into (text, hold_seconds) pieces so counted reps land at rep pace.
+
+    only a run of two or more number words at the START of a clause counts, so
+    ordinary speech ("ten on each arm") is never broken up. anything after the run
+    is kept whole and unpaced, which is what carries the form cue.
+
+    inputs:
+    text: one speech clause
+    outputs:
+    list of (segment_text, hold_seconds); hold 0 means play at natural length
+    """
+    match = _RE_COUNT_RUN.match(text or "")
+    if not match:
+        return [(text, 0.0)]
+    run, remainder = match.group(1), match.group(2).strip()
+    tokens = [t.strip() for t in _RE_COUNT_TOKEN.findall(run) if t.strip()]
+    if len(tokens) < 2:
+        return [(text, 0.0)]
+    segments = [(t, REP_SECONDS) for t in tokens]
+    if remainder:
+        segments.append((remainder, 0.0))
+    return segments
+# roughly two seconds of phone mic audio. what a barge-in keeps: enough to hold
+# the words the user interrupted with, not the whole reply's worth of room noise.
+PHONE_MIC_BARGE_KEEP_CHUNKS = int(os.environ.get("PHONE_MIC_BARGE_KEEP_CHUNKS", "48"))
 _AUDIO_SINK = "tablet"  # droid | mac | phone | tablet, recorded in turn metrics
 
 ### dynamic voice speed per emotion
@@ -309,7 +361,9 @@ async def send_greeting():
                 GREETING_SPEECH,
                 GREETING_EMOTION,
                 GREETING_COLOR,
-                silent=not PEERBOTS_DUAL_AUDIO,
+                # kokoro owns the voice here; the tablet gets the text only so
+                # the mouth moves. volume 1.0 would play a second voice under it.
+                silent=True,
             )
             audio_bytes = await synthesize_speech(
                 GREETING_SPEECH,
@@ -336,7 +390,9 @@ async def _delayed_think(delay):
     # latency mask: stays silent unless the llm is slower than delay
     await asyncio.sleep(delay)
     try:
-        await asend_peerbots_message(THINKING_SPEECH, THINKING_EMOTION, THINKING_COLOR)
+        await asend_peerbots_message(
+            THINKING_SPEECH, THINKING_EMOTION, THINKING_COLOR, silent=_USE_DROID
+        )
     except Exception as e:
         console.print(f"[dim yellow][[ thinking mask failed: {e} ]][/]")
 
@@ -474,9 +530,20 @@ async def handle_turn(user_text, tools_list, tool_router, mic_source=None):
                         target_speed = get_voice_speed_for_emotion(
                             current_emotion, KOKORO_SPEED
                         )
-                        audio_data = await synthesize_speech(
-                            sentence_text, voice=KOKORO_VOICE, speed=target_speed
-                        )
+                        # a counted run becomes one piece of audio per number, each
+                        # held for a rep. everything else is a single segment, so
+                        # ordinary replies take exactly the path they always did.
+                        segments = _rep_pacing_segments(sentence_text)
+                        parts = []
+                        for seg_text, hold_s in segments:
+                            parts.append(
+                                (
+                                    await synthesize_speech(
+                                        seg_text, voice=KOKORO_VOICE, speed=target_speed
+                                    ),
+                                    hold_s,
+                                )
+                            )
                         s_ms = int((time.time() - s_start) * 1000)
                         if idx == 0:
                             tts1_ms = s_ms
@@ -485,12 +552,28 @@ async def handle_turn(user_text, tools_list, tool_router, mic_source=None):
                             chunk_order_events[idx] = asyncio.Event()
                         try:
                             await chunk_order_events[idx].wait()
-                            if audio_data:
+                            is_first_part = True
+                            for audio_data, hold_s in parts:
+                                if not audio_data:
+                                    continue
                                 if not first_audio_sent:
                                     first_audio_sent = True
                                     first_audio_time = time.time()
                                     timer.mark("first_audio_sent")
-                                await _PLAYBACK_QUEUE.enqueue(audio_data, chunk_idx=idx)
+                                hold = None
+                                if hold_s:
+                                    # pad the pacing, never clip a number that
+                                    # happens to take longer than a rep to say
+                                    hold = max(hold_s, get_audio_duration_s(audio_data))
+                                await _PLAYBACK_QUEUE.enqueue(
+                                    audio_data,
+                                    duration_s=hold,
+                                    # only the first piece carries the ordering index;
+                                    # the rest ride behind it, or the queue logs a
+                                    # chunk inversion for every number.
+                                    chunk_idx=idx if is_first_part else None,
+                                )
+                                is_first_part = False
                         finally:
                             next_idx = idx + 1
                             if next_idx not in chunk_order_events:
@@ -507,12 +590,15 @@ async def handle_turn(user_text, tools_list, tool_router, mic_source=None):
                     full_text = final_reply.get("speech", "") or " ".join(
                         spoken_sentences
                     )
-                    # send speech to peerbots to animate mouth; browser audio is muted on android
+                    # send speech to peerbots to animate the mouth. this used to
+                    # assume the tablet browser was muted on android; on the handset
+                    # it is not, so volume 1.0 played the cloud tts underneath
+                    # kokoro. text still goes up, volume does not.
                     fire_peerbots_update(
                         full_text,
                         final_reply.get("emotion", current_emotion),
                         final_reply.get("color", "White"),
-                        silent=False,
+                        silent=True,
                     )
 
     finally:
@@ -954,13 +1040,18 @@ async def phone_mic_loop(
                     text, tools_list, tool_router, mic_source=source
                 )
                 # after a barge-in the queue holds the user's live speech, so
-                # draining it would discard the interruption itself
-                if not was_interrupted:
-                    while not server.audio_queue.empty():
-                        try:
-                            server.audio_queue.get_nowait()
-                        except Exception:
-                            break
+                # draining it would discard the interruption itself. it also holds
+                # everything the room said while lulo was replying, though, and on
+                # a long turn that is tens of seconds of stale audio sitting in
+                # front of the interruption. transcribing the backlog first is how
+                # a turn comes back doubled or garbled, so keep the tail and drop
+                # the history.
+                keep = 0 if not was_interrupted else PHONE_MIC_BARGE_KEEP_CHUNKS
+                while server.audio_queue.qsize() > keep:
+                    try:
+                        server.audio_queue.get_nowait()
+                    except Exception:
+                        break
                 console.print("\n[bold dark_orange][[LISTENING (PHONE MIC)]][/]")
     finally:
         await server.stop()
@@ -1103,6 +1194,10 @@ async def amain(
     if enable_arduino:
         _ARM = ArmController()
         await _ARM.start()
+        # let the model see where the body actually is. without this it is told it
+        # has a height it can change but is never told what that height currently
+        # is, so it cannot reason about growing taller or settling back down.
+        openai_response.BODY_STATE_PROVIDER = _ARM.last_known_position
 
     # semantic endpointing: load and warm the graph now, not on the first turn
     if use_smart_turn:

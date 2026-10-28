@@ -503,9 +503,18 @@ async def benchmark_naturalness_and_flow():
     # ~3k tokens of prompt plus history could never hit the prompt cache. the
     # counter is metrics-only now, and the hints are off by default because they
     # push the model off the study's verbatim dialogue-tree lines.
-    prefix = _build_session_prefix()
-    assert 'session: turn' not in prefix, 'turn marker would break prompt caching'
-    assert prefix == '', 'anti-repetition hints should be opt-in via LULO_ANTI_REPETITION'
+    # pin the flag rather than reading whatever the local .env happens to say:
+    # this asserts the CODE default is opt-in, and it must not start failing just
+    # because a developer has opted in on their own machine.
+    import scripts.openai_response as _oresp_default
+    _was = _oresp_default.ANTI_REPETITION
+    _oresp_default.ANTI_REPETITION = False
+    try:
+        prefix = _build_session_prefix()
+        assert 'session: turn' not in prefix, 'turn marker would break prompt caching'
+        assert prefix == '', 'anti-repetition hints should be opt-in via LULO_ANTI_REPETITION'
+    finally:
+        _oresp_default.ANTI_REPETITION = _was
     assert get_session_context()['turn_count'] == 1, 'turn count still tracked for metrics'
 
     # with the flag on, the hints come back - but as tail text, never a prefix
@@ -597,9 +606,12 @@ async def benchmark_dialogue_tree_and_pausing():
 
     # 5. system prompt contains dialogue tree nodes & gaze cues
     prompt = load_system_prompt()
-    assert 'squats' in prompt.lower(), 'prompt must specify squats exercise'
+    # the study exercise is bicep curls, ten per arm. the prompt and the prewarmed
+    # scripted lines have to agree on the wording or the tts cache stops hitting.
+    assert 'bicep curls' in prompt.lower(), 'prompt must specify the bicep curl exercise'
+    assert 'ten on each arm' in prompt.lower(), 'prompt must specify ten reps per arm'
     assert 'curious deer' in prompt.lower(), 'prompt must contain deer backstory'
-    assert '90 degrees' in prompt.lower(), 'prompt must contain 90 degrees squat info'
+    assert 'elbow' in prompt.lower(), 'prompt must contain the curl form cue'
     assert 'throbbing' in prompt.lower(), 'prompt must contain throbbing knee escalation'
     assert 'flag me when' in prompt.lower(), 'prompt must contain break recovery phrasing'
     assert 'turn_action' in prompt, 'prompt must specify turn_action key'

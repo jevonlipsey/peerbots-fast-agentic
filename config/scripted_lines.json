@@ -30,15 +30,19 @@
       "emotion": "Happy"
     },
     {
-      "speech": "Great! Your first exercise is squats. Any questions? If not, let's proceed.",
+      "speech": "Great! Today it's bicep curls, ten on each arm. Any questions? If not, let's proceed.",
       "emotion": "Happy"
     },
     {
-      "speech": "One... two... three... keep that back straight!",
+      "speech": "One... two... three... keep that elbow tucked in!",
       "emotion": "Neutral"
     },
     {
-      "speech": "Let's see what your therapist recommends... your therapist recommends squatting only to 90 degrees.",
+      "speech": "That's ten! Switch arms whenever you're ready.",
+      "emotion": "Happy"
+    },
+    {
+      "speech": "Let's see what your therapist recommends... your therapist recommends slow and controlled, and keeping that elbow pinned to your side.",
       "emotion": "Neutral"
     },
     {
@@ -46,7 +50,7 @@
       "emotion": "Happy"
     },
     {
-      "speech": "I'm not sure. Your therapist gave me concrete information on that. I recommend you contact them!",
+      "speech": "I'm not sure. Your therapist didn't give me concrete information on that. I recommend you contact them!",
       "emotion": "Concerned"
     },
     {
@@ -78,7 +82,7 @@
       "emotion": "Happy"
     },
     {
-      "speech": "Great! Let’s get back into it.",
+      "speech": "Great! Let\u2019s get back into it.",
       "emotion": "Happy"
     },
     {
@@ -90,7 +94,7 @@
       "emotion": "Happy"
     },
     {
-      "speech": "Good call, flag me when you’re ready.",
+      "speech": "Good call, flag me when you\u2019re ready.",
       "emotion": "Neutral"
     },
     {
@@ -98,7 +102,7 @@
       "emotion": "Neutral"
     },
     {
-      "speech": "Woohoo! You finished the set! Great work, we’ll wrap today.",
+      "speech": "Woohoo! You finished the set! Great work, we\u2019ll wrap today.",
       "emotion": "Happy"
     },
     {

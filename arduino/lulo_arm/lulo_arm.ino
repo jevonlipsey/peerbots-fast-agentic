@@ -10,6 +10,7 @@
 //   STOP                 -> stop immediately, cancel any running gesture
 //   RESET                -> assume fully retracted (pos = 0) and stop
 //   HOME                 -> drive to the idle parking position (REST_POS_MS)
+//   GOTO <0-100>         -> drive to an absolute height, as a percent of stroke
 //   SPEED <0-255>        -> set pwm duty for subsequent moves
 //   UP [ms] / DOWN [ms]  -> drive for ms, or continuously when ms is omitted
 //   GESTURE <name>       -> play a canned gesture:
@@ -29,6 +30,13 @@ const int IN2 = 8;
 
 uint8_t speed = 255;                       // 0-255
 
+// CALIBRATION: this is the one number the whole body depends on. it is the time
+// the actuator needs to cover its full stroke, and every gesture, the soft limits
+// and the parking position are derived from it. if it is set SHORTER than the real
+// stroke, the firmware believes it has run out of travel while the rod still has
+// room, clamps the move, and every gesture comes out small no matter how large the
+// steps below are. to measure: send RESET (assume fully retracted), then UP, and
+// time how long until the rod physically stops. put that number here and reflash.
 const unsigned long STROKE_MS   = 5000;    // time to travel full stroke; set to your actuator's
 
 // the actuator covers its ~10cm stroke in STROKE_MS, so roughly 2cm/s. the
@@ -44,7 +52,10 @@ const unsigned long STROKE_MS   = 5000;    // time to travel full stroke; set to
 // was previously a no-op: it only drives DOWN, and drive() refuses to go down
 // from 0, which is exactly where the idle position was. Sad and Sleepy therefore
 // did nothing at all.
-const unsigned long REST_POS_MS = 1750;    // idle parking position, ~35% extended
+// parked mid-stroke, so a gesture has the same room in both directions. at 35%
+// a nod had 3.25s of travel above it but slump only 1.75s below, which is why
+// downward gestures read so much smaller than upward ones.
+const unsigned long REST_POS_MS = 2500;    // idle parking position, mid-stroke
 const unsigned long DEBOUNCE_MS = 30;
 const unsigned long HOLD_MS     = 200;     // press longer than this counts as a hold (not a tap)
 const unsigned long DOUBLE_MS   = 350;     // max gap between tap release and second press
@@ -76,11 +87,23 @@ const Step G_STOP[]    = { {'S', 0, 0} };
 const Step G_REST[]    = { {'S', 0, 0} };
 const Step G_EXTEND[]  = { {'U', STROKE_MS, 0} };
 const Step G_RETRACT[] = { {'D', STROKE_MS, 0} };
-const Step G_NOD[]     = { {'U', 800, 80}, {'D', 800, 0} };
-const Step G_BOUNCE[]  = { {'U', 750, 70}, {'D', 750, 70}, {'U', 750, 70}, {'D', 750, 0} };
-const Step G_STARTLE[] = { {'U', 1200, 250}, {'D', 1200, 0} };
-const Step G_SLUMP[]   = { {'D', 1400, 400}, {'U', 1400, 0} };
-const Step G_WAVE[]    = { {'U', 700, 50}, {'D', 700, 50}, {'U', 700, 50}, {'D', 700, 0} };
+// scaled to use nearly the whole stroke rather than a slice in the middle of it.
+// from REST_POS_MS = 2500 there is 2500ms (~5cm) of travel each way, and startle
+// and slump now take almost all of it: startle peaks at 4900 of 5000, slump
+// bottoms out at 300. every gesture is still net-zero, so the position estimate
+// cannot drift. if a gesture ever stops short, the soft limits are clamping it,
+// which means STROKE_MS is smaller than the real stroke -- see the note there.
+// the motor is loud enough to bury lulo's voice, and pwm is already at 255, so
+// there is no "faster" available -- only shorter. speech starts roughly 0.9-1.4s
+// after a gesture fires (ttft, then first-clause tts), so a gesture that finishes
+// inside ~1.4s is over before she speaks and never competes with her. the four
+// step bounce and wave also just read as grinding back and forth, so both are now
+// a single beat. cost of all this: ~1.3-1.8cm of travel rather than 3-4.8cm.
+const Step G_NOD[]     = { {'U', 700, 60}, {'D', 700, 0} };
+const Step G_BOUNCE[]  = { {'U', 650, 60}, {'D', 650, 0} };
+const Step G_STARTLE[] = { {'U', 900, 120}, {'D', 900, 0} };
+const Step G_SLUMP[]   = { {'D', 900, 200}, {'U', 900, 0} };
+const Step G_WAVE[]    = { {'U', 600, 50}, {'D', 600, 0} };
 
 const Gesture GESTURES[] = {
   {"stop",    G_STOP,    1},
@@ -249,6 +272,29 @@ void handleCommand(char* line) {
       moveEndMs = 0;
     }
     Serial.println(F("OK HOME"));
+  } else if (strcasecmp(line, "GOTO") == 0) {
+    // absolute height as a percentage of stroke. the pipeline tracks lulo's
+    // posture as a number the model can reason about ("you are at 40%"), so it
+    // needs to command a position rather than a direction and a duration.
+    if (arg) {
+      long pct = constrain(atol(arg), 0, 100);
+      unsigned long target = ((unsigned long)pct * STROKE_MS) / 100UL;
+      cancelGesture();
+      if (posMs < target) {
+        drive(UP);
+        moveEndMs = millis() + (target - posMs);
+      } else if (posMs > target) {
+        drive(DOWN);
+        moveEndMs = millis() + (posMs - target);
+      } else {
+        drive(STOPPED);
+        moveEndMs = 0;
+      }
+      Serial.print(F("OK GOTO "));
+      Serial.println(pct);
+    } else {
+      Serial.println(F("ERR GOTO needs 0-100"));
+    }
   } else if (strcasecmp(line, "SPEED") == 0) {
     if (arg) {
       long v = atol(arg);

@@ -612,8 +612,15 @@ def listen_audio_silero(
 # barge-in needs a higher bar than normal onset. echo cancellation on the handset
 # is good but not perfect, and a false trigger cuts lulo off mid-word for nothing,
 # which reads worse than not supporting interruption at all.
-BARGE_IN_THRESHOLD = float(os.environ.get('BARGE_IN_THRESHOLD', '0.80'))
-BARGE_IN_FRAMES = int(os.environ.get('BARGE_IN_FRAMES', '7'))  # ~224ms sustained
+# a false cut is far worse than a missed one: lulo going silent because someone
+# shifted a chair reads as broken, while having to say a word twice to interrupt
+# her reads as normal. 0.80 / 7 frames (~224ms) let room noise stop her mid-word,
+# so both are deliberately well clear of ordinary clatter. frames must be
+# CONSECUTIVE -- any frame under threshold resets the count -- and a cough or a
+# door simply cannot hold a vad probability this high for this long. real speech
+# can, and does, within about half a second.
+BARGE_IN_THRESHOLD = float(os.environ.get('BARGE_IN_THRESHOLD', '0.92'))
+BARGE_IN_FRAMES = int(os.environ.get('BARGE_IN_FRAMES', '14'))  # ~448ms sustained
 
 
 def watch_for_barge_in(source, stop_event, threshold=None, frames_needed=None):

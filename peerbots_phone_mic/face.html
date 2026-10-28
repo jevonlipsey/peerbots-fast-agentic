@@ -19,14 +19,24 @@ iframe{position:fixed;inset:0;width:100%;height:100%;border:0;z-index:1}
    who is being addressed. one tap stops her listening without killing the session. */
 #mute{position:fixed;z-index:9999;right:8px;bottom:8px;padding:10px 14px;border:0;border-radius:8px;font-size:13px;font-weight:600;background:#3ddc84;color:#06240f;box-shadow:0 4px 14px #0008}
 #mute.off{background:#ff5f56;color:#2a0806}
+/* the handset volume keys cannot raise this: both android streams are already at
+   max, and with echo cancellation on the page often sits on the voice-call stream
+   that the keys do not touch outside a call. so volume lives here instead. */
+#vol{position:fixed;z-index:9999;right:8px;bottom:56px;display:flex;align-items:center;gap:0;border-radius:8px;overflow:hidden;box-shadow:0 4px 14px #0008}
+#vol button{border:0;padding:10px 14px;font-size:16px;font-weight:700;background:#222;color:#fff}
+#vol span{padding:10px 8px;font-size:13px;font-weight:600;background:#111;color:#3ddc84;min-width:34px;text-align:center}
 #fill{height:100%;width:0%;background:#3ddc84;transition:width .06s linear}
 </style>
 </head>
 <body>
-<iframe src="https://app.peerbots.org/face" allow="autoplay; camera; microphone; fullscreen" allowfullscreen></iframe>
+<!-- no autoplay: kokoro owns the voice on this handset. the embedded face app
+     will happily speak a message over the top of it, and a cross-origin iframe
+     cannot be muted from out here, so it is simply never granted audio. -->
+<iframe src="https://app.peerbots.org/face" allow="camera; microphone; fullscreen" allowfullscreen></iframe>
 <button id="start">Enable microphone<small>so the robot can hear you</small></button>
 <div id="bar"><span id="status">Not connected</span><span id="meter"><span id="fill"></span></span></div>
 <button id="mute" hidden>Listening</button>
+<div id="vol" hidden><button id="voldn">&minus;</button><span id="vollabel">3.0</span><button id="volup">+</button></div>
 <script>
 const startBtn=document.getElementById('start'),statusEl=document.getElementById('status'),fillEl=document.getElementById('fill'),muteBtn=document.getElementById('mute');
 let micEnabled=true;
@@ -37,7 +47,35 @@ muteBtn.onclick=()=>{
   // the level meter deliberately keeps running while muted, so a muted mic still
   // looks obviously alive rather than indistinguishable from a broken one
 };
-let audioContext,stream,socket,processor;
+const volBox=document.getElementById('vol'),volLabel=document.getElementById('vollabel');
+let audioContext,stream,socket,processor,outputGain;
+// lulo is quiet on the handset and the phone's volume keys cannot help: both
+// android streams sit at maximum already (MUSIC 15/15, VOICE_CALL 8/8). the page
+// was connecting tts straight to the destination with no gain stage, so max
+// really was max. boost here instead, with a limiter after it so raising the
+// gain adds loudness rather than clipping distortion.
+// override live for a room: http://localhost:8443/?vol=4
+const OUTPUT_GAIN=(()=>{
+  const q=parseFloat(new URLSearchParams(location.search).get('vol'));
+  if(isFinite(q)&&q>0&&q<=8)return q;
+  // remembered per handset. storage can throw in a private window or with site
+  // data blocked, so a failure here must never stop the page loading.
+  try{
+    const saved=parseFloat(localStorage.getItem('luloGain'));
+    if(isFinite(saved)&&saved>0&&saved<=8)return saved;
+  }catch(e){}
+  return 3;
+})();
+
+let currentGain=OUTPUT_GAIN;
+function applyGain(v){
+  currentGain=Math.max(0.5,Math.min(8,Math.round(v*10)/10));
+  if(outputGain)outputGain.gain.value=currentGain;
+  volLabel.textContent=currentGain.toFixed(1);
+  try{localStorage.setItem('luloGain',String(currentGain));}catch(e){}
+}
+document.getElementById('volup').onclick=()=>applyGain(currentGain+0.5);
+document.getElementById('voldn').onclick=()=>applyGain(currentGain-0.5);
 const setStatus=t=>{statusEl.textContent=t;};
 
 // websocket may drop when the phone sleeps or the laptop process restarts, so keep retrying.
@@ -135,7 +173,7 @@ function playNextClip(){
   if(audioContext.state==='suspended')audioContext.resume().catch(()=>{});
   const src=audioContext.createBufferSource();
   src.buffer=speechQueue.shift();
-  src.connect(audioContext.destination);
+  src.connect(outputGain||audioContext.destination);
   const first=!liveSource;
   liveSource=src;
   src.onended=()=>{speakingClip=false;if(liveSource===src)playNextClip();};
@@ -178,15 +216,27 @@ startBtn.onclick=async()=>{
   try{
     audioContext=new (window.AudioContext||window.webkitAudioContext)();
     await audioContext.resume();
+    // gain -> limiter -> speaker. the limiter is a compressor with a hard ratio
+    // and a fast attack, so peaks are caught instead of squared off.
+    outputGain=audioContext.createGain();
+    outputGain.gain.value=currentGain;
+    volBox.hidden=false;
+    applyGain(currentGain);
+    const limiter=audioContext.createDynamicsCompressor();
+    limiter.threshold.value=-4;
+    limiter.knee.value=0;
+    limiter.ratio.value=20;
+    limiter.attack.value=0.003;
+    limiter.release.value=0.12;
+    outputGain.connect(limiter);
+    limiter.connect(audioContext.destination);
     const source=audioContext.createMediaStreamSource(stream);
-    // ScriptProcessor is deprecated but is the only node available without an extra served worklet file
-    processor=audioContext.createScriptProcessor(4096,1,1);
     const mute=audioContext.createGain();mute.gain.value=0;
-    source.connect(processor);processor.connect(mute);mute.connect(audioContext.destination);
+    mute.connect(audioContext.destination);
 
     let carry=new Float32Array(0);
-    processor.onaudioprocess=(event)=>{
-      const input=event.inputBuffer.getChannelData(0);
+    // one frame of captured mono audio. identical work on both capture paths.
+    const handleFrame=(input)=>{
 
       // level meter so it is obvious the mic is actually capturing, not just connected
       let sum=0;
@@ -218,6 +268,41 @@ startBtn.onclick=async()=>{
       // drop audio rather than let a backed-up socket grow without bound
       if(socket.bufferedAmount<262144)socket.send(out.buffer);
     };
+
+    // ScriptProcessor runs its callback on the MAIN thread, and this page also
+    // renders a full-screen animated face. every time rendering janks the callback
+    // is skipped and those samples are gone for good -- which the server sees as
+    // 'link gap ... dropped audio, not silence', and which chops utterances so the
+    // endpointer ends a turn that never finished. an AudioWorklet runs on the audio
+    // thread, so the page can stall without losing a sample. loaded from a blob url
+    // so there is still no extra file to serve. falls back to the old path if the
+    // worklet cannot be installed, so this can never be worse than before.
+    let usingWorklet=false;
+    try{
+      if(audioContext.audioWorklet){
+        const src='class C extends AudioWorkletProcessor{'
+          +'constructor(){super();this.buf=new Float32Array(2048);this.n=0}'
+          +'process(i){const c=i[0]&&i[0][0];if(c){for(let k=0;k<c.length;k++){'
+          +'this.buf[this.n++]=c[k];'
+          +'if(this.n===this.buf.length){this.port.postMessage(this.buf.slice(0));this.n=0}}}'
+          +'return true}}'
+          +'registerProcessor("cap",C)';
+        const url=URL.createObjectURL(new Blob([src],{type:'application/javascript'}));
+        await audioContext.audioWorklet.addModule(url);
+        URL.revokeObjectURL(url);
+        const node=new AudioWorkletNode(audioContext,'cap');
+        node.port.onmessage=(e)=>handleFrame(e.data);
+        source.connect(node);node.connect(mute);
+        usingWorklet=true;
+      }
+    }catch(err){usingWorklet=false;}
+
+    if(!usingWorklet){
+      processor=audioContext.createScriptProcessor(4096,1,1);
+      source.connect(processor);processor.connect(mute);
+      processor.onaudioprocess=(event)=>handleFrame(event.inputBuffer.getChannelData(0));
+    }
+    setStatus(usingWorklet?'Live - speak':'Live - speak (fallback capture)');
 
     connectSocket();
   }catch(err){

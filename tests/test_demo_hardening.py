@@ -193,7 +193,9 @@ def test_handle_turn_records_a_metric_and_fires_the_face_early(monkeypatch, tmp_
         def reset_turn(self):
             order.append('reset')
 
-        async def enqueue(self, audio, chunk_idx=None):
+        # mirrors the real sinks: all three take duration_s, which paced rep
+        # counting uses to hold a number on screen for a whole rep
+        async def enqueue(self, audio, duration_s=None, chunk_idx=None):
             order.append(f'audio{chunk_idx}')
 
         async def wait_complete(self):
@@ -409,3 +411,128 @@ def test_smart_turn_contract():
     # absent weights must degrade to the fixed window, never raise
     if not smart_turn.model_available():
         assert smart_turn.turn_complete_probability([0.0] * 1000) is None
+
+
+def test_silent_face_update_carries_no_speech():
+    '''
+    'volume': 0.0 did not stop the cloud tts. the face app speaks whatever is in
+    'speech', so a silent update that still carried the text played a second
+    voice underneath kokoro on the handset.
+    '''
+    from scripts.peerbots_client import _build_payload
+
+    loud = _build_payload('hello there', 'Happy', 'Blue', silent=False)
+    assert loud['speech'] == 'hello there'
+    assert loud['volume'] == 1.0
+
+    quiet = _build_payload('hello there', 'Happy', 'Blue', silent=True)
+    assert quiet['speech'] == ''
+    assert quiet['volume'] == 0.0
+    assert quiet['emotion'] == 'Happy', 'emotion and colour must still reach the face'
+    assert quiet['color'] == 'Blue'
+
+
+def test_face_iframe_is_not_granted_autoplay():
+    '''a cross-origin iframe cannot be muted from the parent, so it never gets audio'''
+    page = open(os.path.join(ROOT_DIR, 'peerbots_phone_mic', 'face.html'), encoding='utf-8').read()
+    iframe = [ln for ln in page.splitlines() if '<iframe' in ln][0]
+    assert 'autoplay' not in iframe, 'face iframe must not be allowed to autoplay audio'
+
+
+def test_emotion_gestures_only_fire_on_change():
+    '''
+    firing on every reply drove a full gesture per turn. once gestures were scaled
+    up to read across a room that was constant motion and constant motor noise.
+    '''
+    from scripts.arm_controller import ArmController
+
+    arm = ArmController(simulate=True)
+    fired = []
+    arm.fire = lambda cmd: fired.append(cmd)
+
+    arm.fire_emotion('Happy')
+    arm.fire_emotion('Happy')
+    arm.fire_emotion('Happy')
+    assert fired == ['GESTURE BOUNCE'], 'a repeated emotion must not re-fire'
+
+    arm.fire_emotion('Sad')
+    assert fired == ['GESTURE BOUNCE', 'GESTURE SLUMP'], 'a change must fire'
+
+    arm.fire_emotion('Happy')
+    assert fired[-1] == 'GESTURE BOUNCE', 'changing back fires again'
+
+
+def test_barge_in_keeps_the_tail_not_the_backlog():
+    '''
+    an interrupted turn must not hand the next transcribe tens of seconds of room
+    audio that piled up while lulo was talking, ahead of the actual interruption.
+    '''
+    import main as _main
+
+    assert _main.PHONE_MIC_BARGE_KEEP_CHUNKS > 0, 'barge-in must keep the interruption'
+    # must be far below the queue depth, or trimming is a no-op
+    from scripts.phone_mic_server import PHONE_MIC_QUEUE_CHUNKS
+
+    assert _main.PHONE_MIC_BARGE_KEEP_CHUNKS < PHONE_MIC_QUEUE_CHUNKS / 2, (
+        'keeping most of the queue would leave the stale backlog in place'
+    )
+
+
+def test_scripted_lines_match_the_prompt_verbatim():
+    '''
+    the prewarm caches whatever scripted_lines.json says. if the prompt tells the
+    model to say something slightly different, every one of those turns pays full
+    tts latency instead of hitting a 0ms cached clause -- silently.
+    '''
+    import json
+
+    prompt = open(os.path.join(ROOT_DIR, 'config', 'system_prompt.md'), encoding='utf-8').read()
+    lines = json.load(open(os.path.join(ROOT_DIR, 'config', 'scripted_lines.json'), encoding='utf-8'))['lines']
+    spoken = {l['speech'] for l in lines}
+
+    for key in (
+        "Great! Today it's bicep curls, ten on each arm. Any questions? If not, let's proceed.",
+        'One... two... three... keep that elbow tucked in!',
+        "That's ten! Switch arms whenever you're ready.",
+    ):
+        assert key in spoken, f'{key!r} must be prewarmed'
+        assert key in prompt, f'{key!r} must be the wording the prompt asks for'
+
+    assert 'squat' not in prompt.lower(), 'the old exercise must not linger in the prompt'
+    assert not any('squat' in s.lower() for s in spoken), 'stale squat lines still cached'
+
+
+def test_counted_reps_are_paced_but_ordinary_speech_is_not():
+    '''
+    "One... two... three..." is one tts clause, so kokoro read it as a single
+    breath and the patient heard "123" in under a second -- no use as a pace to
+    curl to. each number becomes its own held segment instead.
+    '''
+    import main as _main
+
+    paced = _main._rep_pacing_segments('One... two... three... keep that elbow tucked in!')
+    assert [t for t, _ in paced] == ['One...', 'two...', 'three...', 'keep that elbow tucked in!']
+    assert all(h == _main.REP_SECONDS for _, h in paced[:3]), 'each number holds for a rep'
+    assert paced[-1][1] == 0.0, 'the form cue plays at natural speed'
+    assert 1.4 <= _main.REP_SECONDS <= 2.5, 'a rep should be roughly 1.5-2s'
+
+    # a number inside ordinary speech must not split the sentence up
+    for ordinary in (
+        "Great! Today it's bicep curls, ten on each arm.",
+        'Nice work, that is ten.',
+        'You got this!',
+    ):
+        assert _main._rep_pacing_segments(ordinary) == [(ordinary, 0.0)], ordinary
+
+
+def test_page_has_its_own_output_gain_and_control():
+    '''
+    the handset volume keys cannot raise lulo: both android streams sit at max
+    already, and with echo cancellation on the page often lands on the voice-call
+    stream the keys do not touch outside a call. the page owns its own gain.
+    '''
+    page = open(os.path.join(ROOT_DIR, 'peerbots_phone_mic', 'face.html'), encoding='utf-8').read()
+    assert 'createGain()' in page, 'tts needs a gain stage, not a bare destination connect'
+    assert 'createDynamicsCompressor()' in page, 'raising gain without a limiter just clips'
+    assert "connect(outputGain" in page, 'playback must route through the gain node'
+    assert 'luloGain' in page, 'the chosen level should survive a reload'

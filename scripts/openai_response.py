@@ -180,6 +180,26 @@ REPLY_SCHEMA = {
 # off the study's verbatim dialogue-tree lines (see _build_session_prefix).
 ANTI_REPETITION = os.environ.get('LULO_ANTI_REPETITION', '').lower() in ('1', 'true', 'yes')
 
+# set by main to ArmController.last_known_position when a body is attached. lulo
+# has no position sensor and the model cannot see him, so unless his height is
+# put in front of it every turn it has no way to know whether it is already
+# standing tall. read from cache, never over serial: this sits on the turn's
+# critical path.
+BODY_STATE_PROVIDER = None
+
+
+def _describe_body_state():
+    '''one short line of posture state, or '' when there is no body attached'''
+    if BODY_STATE_PROVIDER is None:
+        return ''
+    try:
+        pos = BODY_STATE_PROVIDER()
+    except Exception:
+        return ''
+    if pos is None:
+        return ''
+    return f'Body height right now: {int(pos)}% of full stroke'
+
 _MODEL_NEEDS_REASONING_NONE = _needs_reasoning_none(MODEL)
 _RESPONSE_FORMAT = {
     'type': 'json_schema',
@@ -623,10 +643,18 @@ def _build_session_prefix():
     global _SESSION_TURN_COUNT
     _SESSION_TURN_COUNT += 1
 
-    if not ANTI_REPETITION:
-        return ''
-
     hints = []
+
+    # posture is reported whether or not the opener hints are on: it is state the
+    # model needs, not a stylistic nudge, and it still rides at the tail so the
+    # cacheable prefix is untouched.
+    body = _describe_body_state()
+    if body:
+        hints.append(body)
+
+    if not ANTI_REPETITION:
+        return '; '.join(hints)
+
     if _RECENT_OPENERS:
         last_openers = _RECENT_OPENERS[-3:]
         openers_str = ', '.join(f"'{o}'" for o in last_openers)

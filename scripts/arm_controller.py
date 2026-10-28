@@ -27,6 +27,8 @@ CONTROL_HOST = os.environ.get('LULO_ARM_HOST', '127.0.0.1')
 CONTROL_PORT = int(os.environ.get('LULO_ARM_PORT', '5007'))
 ACK_TIMEOUT_S = 1.5
 GESTURE_DEDUPE_S = float(os.environ.get('LULO_ARM_DEDUPE_S', '0.6'))
+# must match REST_POS_MS / STROKE_MS in lulo_arm.ino
+REST_POS_PERCENT = int(os.environ.get('LULO_ARM_REST_PERCENT', '50'))
 
 
 def _port_env():
@@ -407,7 +409,49 @@ class ArmController:
         return await self.send_command('STOP')
 
     async def reset(self):
-        return await self.send_command('RESET')
+        # the rod is wound back to fully retracted by hand before a session, so
+        # RESET is what makes the firmware's estimate agree with the hardware.
+        reply = await self.send_command('RESET')
+        if reply is not None:
+            self._note_position(0)
+        return reply
+
+    async def goto(self, percent):
+        '''
+        drive to an absolute height, 0 (retracted) to 100 (fully extended).
+
+        inputs:
+        percent: target height as a percent of stroke
+        outputs:
+        firmware reply, or None when the value is unusable
+        '''
+        try:
+            pct = int(round(float(percent)))
+        except (TypeError, ValueError):
+            return None
+        pct = max(0, min(100, pct))
+        reply = await self.send_command(f'GOTO {pct}')
+        if reply is not None:
+            self._note_position(pct)
+        return reply
+
+    def _note_position(self, pct):
+        '''
+        remember where we just commanded the body to go.
+
+        the llm is told lulo's height on every turn, and a serial round trip on
+        the turn's critical path would cost more than the number is worth. every
+        gesture is net-zero and GOTO/HOME/RESET are absolute, so the commanded
+        height stays truthful without asking the board.
+        '''
+        status = dict(self._last_status)
+        status['pos'] = int(pct)
+        self._last_status = status
+
+    def last_known_position(self):
+        '''cached height 0-100, or None before the body has reported in'''
+        pos = self._last_status.get('pos')
+        return int(pos) if pos is not None else None
 
     async def home(self):
         '''
@@ -418,7 +462,10 @@ class ArmController:
         (Sad, Sleepy) did nothing at all. homing on connect also clears whatever
         estimate error the previous session accumulated.
         '''
-        return await self.send_command('HOME')
+        reply = await self.send_command('HOME')
+        if reply is not None:
+            self._note_position(REST_POS_PERCENT)
+        return reply
 
     async def status(self):
         reply = await self.send_command('STATUS')
@@ -429,12 +476,16 @@ class ArmController:
     def fire_emotion(self, emotion):
         '''
         make lulo physically react to a face emotion, without blocking the turn.
-        identical emotions within the dedupe window are ignored so a repeated
-        face update does not machine-gun the actuator.
+
+        only a CHANGE of gesture moves him. firing on every reply meant three
+        Happy turns in a row drove three full bounces, and once the gestures were
+        scaled up to read across a room that became constant motion and constant
+        motor noise through the whole session. holding still between changes is
+        also better hri: the movement means something when it is not continuous.
         '''
         g = gesture_for_emotion(emotion)
         now = time.time()
-        if g == self._last_gesture and (now - self._last_gesture_time) < GESTURE_DEDUPE_S:
+        if g == self._last_gesture:
             return
         self._last_gesture = g
         self._last_gesture_time = now
@@ -461,6 +512,8 @@ class ArmController:
             return await self.halt()
         if cmd == 'reset':
             return await self.reset()
+        if cmd == 'goto':
+            return await self.goto(req.get('percent', req.get('pct')))
         if cmd == 'status':
             return json.dumps(await self.status())
         if cmd == 'ping':

@@ -108,6 +108,30 @@ def actuator_stop() -> str:
 
 
 @mcp.tool()
+def actuator_set_height(percent: int) -> str:
+    """
+    Set Lulo's standing height to an absolute position, as a percent of his full
+    stroke. 0 is fully retracted (lowest), 100 is fully extended (tallest), 50 is
+    his normal resting height.
+    Use this to make posture part of the interaction: grow taller as the user
+    works through a set to show rising energy, or settle lower when they rest.
+    Move in modest steps (10-15% at a time) so the change reads as deliberate.
+    """
+    return send_command({'cmd': 'goto', 'percent': percent})
+
+
+@mcp.tool()
+def actuator_reset_height() -> str:
+    """
+    Declare that Lulo is fully retracted and set his height back to 0.
+    Only correct when the rod really is wound all the way in, which is how a
+    session starts. This re-syncs the firmware's estimate with the hardware --
+    there is no position sensor, so a wrong reset makes every later height wrong.
+    """
+    return send_command({'cmd': 'reset'})
+
+
+@mcp.tool()
 def actuator_status() -> str:
     """Report the actuator's estimated position (0-100%), direction, and whether it is moving."""
     return send_command({'cmd': 'status'})
